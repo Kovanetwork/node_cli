@@ -4,21 +4,63 @@ import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { logger } from './logger.js';
 import { MessageSigner } from './message-signer.js';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 
 export class P2PNode extends EventEmitter {
   private swarm: any;
   private topic: Buffer;
   private connections: Map<string, any> = new Map();
   private signer: MessageSigner;
+  private keyPair: any;
 
   constructor(options: { port: number; bootstrapNodes: string[] }) {
     super();
     this.signer = new MessageSigner();
     this.topic = crypto.createHash('sha256').update('kova-network').digest();
+    this.keyPair = this.loadOrGenerateKeyPair();
+  }
+
+  private loadOrGenerateKeyPair() {
+    const kovaDir = join(homedir(), '.kova');
+    const keyPath = join(kovaDir, 'node-keypair.json');
+
+    try {
+      if (existsSync(keyPath)) {
+        const data = JSON.parse(readFileSync(keyPath, 'utf8'));
+        logger.info('loaded existing node keypair');
+        return {
+          publicKey: Buffer.from(data.publicKey, 'hex'),
+          secretKey: Buffer.from(data.secretKey, 'hex')
+        };
+      }
+    } catch (err) {
+      logger.warn({ err }, 'failed to load keypair, generating new one');
+    }
+
+    // generate new keypair
+    const publicKey = crypto.randomBytes(32);
+    const secretKey = crypto.randomBytes(32);
+
+    try {
+      if (!existsSync(kovaDir)) {
+        mkdirSync(kovaDir, { recursive: true });
+      }
+      writeFileSync(keyPath, JSON.stringify({
+        publicKey: publicKey.toString('hex'),
+        secretKey: secretKey.toString('hex')
+      }));
+      logger.info('generated and saved new node keypair');
+    } catch (err) {
+      logger.warn({ err }, 'failed to save keypair');
+    }
+
+    return { publicKey, secretKey };
   }
 
   async start() {
-    this.swarm = new Hyperswarm();
+    this.swarm = new Hyperswarm({ keyPair: this.keyPair });
 
     // join the kova network topic
     this.swarm.join(this.topic, { server: true, client: true });

@@ -174,7 +174,12 @@ export class AutoBidder {
     const baseCost = cpuCost + memoryCost;
 
     // add margin
-    const price = baseCost * this.config.pricingStrategy.margin;
+    let price = baseCost * this.config.pricingStrategy.margin;
+
+    // minimum bid of 1 to ensure non-zero pricing
+    if (price < 1) {
+      price = 1;
+    }
 
     // round to 2 decimals
     return Math.round(price * 100) / 100;

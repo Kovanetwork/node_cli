@@ -145,17 +145,31 @@ export class DockerManager {
   
   async getContainerStats(containerId: string) {
     const container = this.docker.getContainer(containerId);
+
+    // check if container exists first
+    try {
+      await container.inspect();
+    } catch (err) {
+      throw new Error('container not found or removed');
+    }
+
     const stream = await container.stats({ stream: false });
-    
-    // calc actual usage
-    const memUsage = stream.memory_stats.usage / (1024 * 1024); // mb
-    const cpuDelta = stream.cpu_stats.cpu_usage.total_usage - 
-                     stream.precpu_stats.cpu_usage.total_usage;
-    const systemDelta = stream.cpu_stats.system_cpu_usage - 
-                        stream.precpu_stats.system_cpu_usage;
-    const cpuPercent = (cpuDelta / systemDelta) * 
-                       stream.cpu_stats.online_cpus * 100;
-    
+
+    // calc actual usage with safe access
+    const memUsage = stream.memory_stats?.usage ? stream.memory_stats.usage / (1024 * 1024) : 0; // mb
+
+    let cpuPercent = 0;
+    if (stream.cpu_stats?.cpu_usage && stream.precpu_stats?.cpu_usage) {
+      const cpuDelta = stream.cpu_stats.cpu_usage.total_usage -
+                       stream.precpu_stats.cpu_usage.total_usage;
+      const systemDelta = stream.cpu_stats.system_cpu_usage -
+                          stream.precpu_stats.system_cpu_usage;
+      if (systemDelta > 0) {
+        cpuPercent = (cpuDelta / systemDelta) *
+                     (stream.cpu_stats.online_cpus || 1) * 100;
+      }
+    }
+
     return {
       memory: Math.round(memUsage),
       cpu: Math.round(cpuPercent * 100) / 100,
