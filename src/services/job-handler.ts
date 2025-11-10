@@ -2,8 +2,8 @@ import { EventEmitter } from 'events';
 import { ContainerManager } from './container-manager.js';
 import { P2PNode } from '../lib/p2p.js';
 import { logger } from '../lib/logger.js';
-import { JobSpec } from '@kova/shared';
-import { UsageMeter } from '@kova/payments';
+import { JobSpec } from '../lib/types.js';
+import { UsageMeter } from '../lib/usage-meter.js';
 import { ResourceLimitManager } from '../lib/resource-limits.js';
 
 interface JobExecution {

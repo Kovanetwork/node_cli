@@ -3,7 +3,7 @@ import Hyperswarm from 'hyperswarm';
 import crypto from 'crypto';
 import { EventEmitter } from 'events';
 import { logger } from './logger.js';
-import { MessageSigner } from '@kova/security';
+import { MessageSigner } from './message-signer.js';
 
 export class P2PNode extends EventEmitter {
   private swarm: any;

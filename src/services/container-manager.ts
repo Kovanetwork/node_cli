@@ -1,6 +1,6 @@
 import { DockerManager } from '../lib/docker.js';
 import { logger } from '../lib/logger.js';
-import { JobSpec } from '@kova/shared';
+import { JobSpec } from '../lib/types.js';
 import { EventEmitter } from 'events';
 
 interface RunningContainer {
