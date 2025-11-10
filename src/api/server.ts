@@ -111,29 +111,65 @@ export class NodeAPIServer {
       const { deploymentId } = request.params;
       const targetPort = parseInt(request.headers['x-target-port'] || '80');
 
-      // get container for this deployment
-      const containerInfo = this.containerManager.getContainerInfo(deploymentId);
-      if (!containerInfo) {
-        return reply.code(404).send({ error: 'deployment not found' });
-      }
-
       try {
-        // forward to container via docker network
-        // containers are accessible via their name on docker network
-        const containerHost = `172.17.0.1`; // docker host from inside container
-        const targetUrl = `http://${containerHost}:${targetPort}${request.url.replace(`/deployments/${deploymentId}/proxy`, '')}`;
+        // get container name from deployment id
+        // containers are named: kova-{deploymentId}-{serviceName}
+        // for now, assume first service (need to parse sdl for multi-service)
+        const containerName = `kova-${deploymentId}`;
 
-        // simple proxy - just exec curl inside the container
-        const curlCmd = `curl -X ${request.method} "${targetUrl}" ${
-          request.body ? `-d '${JSON.stringify(request.body)}'` : ''
-        }`;
+        // containers on same docker network can access each other by name
+        // or we can get container IP
+        const Docker = require('dockerode');
+        const docker = new Docker();
 
-        const result = await this.containerManager.execInContainer(deploymentId, curlCmd);
+        const containers = await docker.listContainers({
+          filters: { label: [`kova.deployment=${deploymentId}`] }
+        });
 
-        reply.header('Content-Type', 'text/html');
-        return reply.send(result.stdout);
+        if (containers.length === 0) {
+          return reply.code(404).send({ error: 'deployment container not found or not running' });
+        }
+
+        // get container IP from docker network
+        const containerData = await docker.getContainer(containers[0].Id).inspect();
+        const networks = containerData.NetworkSettings.Networks;
+        const networkName = Object.keys(networks)[0];
+        const containerIP = networks[networkName]?.IPAddress;
+
+        if (!containerIP) {
+          return reply.code(502).send({ error: 'container has no network ip' });
+        }
+
+        // proxy to container
+        const http = require('http');
+        const targetUrl = `http://${containerIP}:${targetPort}${request.url.replace(`/deployments/${deploymentId}/proxy`, '')}`;
+
+        logger.info({ targetUrl, deploymentId }, 'proxying request');
+
+        const proxyReq = http.request(targetUrl, {
+          method: request.method,
+          headers: request.headers
+        }, (proxyRes: any) => {
+          reply.code(proxyRes.statusCode);
+          Object.keys(proxyRes.headers).forEach(key => {
+            reply.header(key, proxyRes.headers[key]);
+          });
+          proxyRes.pipe(reply.raw);
+        });
+
+        proxyReq.on('error', (err: any) => {
+          logger.error({ err, targetUrl }, 'proxy request failed');
+          reply.code(502).send({ error: 'proxy failed', message: err.message });
+        });
+
+        if (request.body) {
+          proxyReq.write(JSON.stringify(request.body));
+        }
+        proxyReq.end();
+
+        return reply;
       } catch (err: any) {
-        logger.error({ err, deploymentId }, 'proxy failed');
+        logger.error({ err, deploymentId }, 'proxy setup failed');
         return reply.code(502).send({ error: 'proxy failed', message: err.message });
       }
     });

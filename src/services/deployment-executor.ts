@@ -143,22 +143,14 @@ export class DeploymentExecutor extends EventEmitter {
       }
     }
 
-    // setup port bindings
+    // setup port exposure (internal only, no host binding)
+    // ingress controller will proxy to these ports via docker network
     const exposedPorts: any = {};
-    const portBindings: any = {};
 
     if (service.expose) {
       for (const expose of service.expose) {
         const containerPort = expose.port;
-        const hostPort = expose.as || expose.port;
-        const isGlobal = expose.to?.some(t => t.global);
-
         exposedPorts[`${containerPort}/tcp`] = {};
-
-        if (isGlobal) {
-          // bind to host for global exposure
-          portBindings[`${containerPort}/tcp`] = [{ HostPort: String(hostPort) }];
-        }
       }
     }
 
@@ -190,14 +182,15 @@ export class DeploymentExecutor extends EventEmitter {
       HostConfig: {
         NetworkMode: networkName,
         Binds: binds,
-        PortBindings: portBindings,
+        // no port bindings - containers only accessible via docker network
         ReadonlyRootfs: false, // allow writes to mounted volumes
         AutoRemove: false,
         RestartPolicy: { Name: 'no' }
       },
       Labels: {
         'kova.deployment': deploymentId,
-        'kova.service': serviceName
+        'kova.service': serviceName,
+        'kova.lease': execution.leaseId
       }
     });
 
