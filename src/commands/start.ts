@@ -16,31 +16,47 @@ import { DeploymentExecutor } from '../services/deployment-executor.js';
 async function registerWithOrchestrator(
   nodeId: string,
   resources: any,
-  walletAddress: string,
+  apiKey?: string,
+  walletAddress?: string,
   orchestratorUrl?: string
-): Promise<{ providerId: string } | null> {
+): Promise<{ providerId: string; walletAddress?: string } | null> {
   if (!orchestratorUrl) {
     logger.warn('no orchestrator URL configured, skipping HTTP registration');
     return null;
   }
 
   try {
+    const body: any = {
+      nodeId,
+      resources,
+      timestamp: Date.now(),
+      version: '0.0.1'
+    };
+
+    // prefer api key over wallet
+    if (apiKey) {
+      body.apiKey = apiKey;
+    } else if (walletAddress) {
+      body.walletAddress = walletAddress;
+    }
+
     const response = await fetch(`${orchestratorUrl}/api/v1/nodes/register`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        nodeId,
-        resources,
-        walletAddress,
-        timestamp: Date.now(),
-        version: '0.0.1'
-      })
+      body: JSON.stringify(body)
     });
 
     if (response.ok) {
       const data: any = await response.json();
-      logger.info({ orchestratorUrl, walletAddress, providerId: data.providerId }, 'registered with orchestrator');
-      return { providerId: data.providerId };
+      logger.info({
+        orchestratorUrl,
+        walletAddress: data.walletAddress,
+        providerId: data.providerId
+      }, 'registered with orchestrator');
+      return {
+        providerId: data.providerId,
+        walletAddress: data.walletAddress
+      };
     } else {
       logger.warn({ status: response.status }, 'failed to register with orchestrator');
       return null;
@@ -54,20 +70,31 @@ async function registerWithOrchestrator(
 export async function startNode(options: any) {
   logger.info('starting kova node...');
 
-  // validate wallet address
+  // check for authentication (api key or wallet)
+  const apiKey = options.apiKey || options.k;
   const walletAddress = options.wallet || options.w;
-  if (!walletAddress) {
-    console.error('\n❌ ERROR: Wallet address is required to start a node');
-    console.error('\nUsage: kova-node start --wallet YOUR_WALLET_ADDRESS');
-    console.error('Example: kova-node start --wallet 0x742d35Cc6634C0532925a3b844Bc9e7595f0bEb');
+
+  if (!apiKey && !walletAddress) {
+    console.error('\n❌ ERROR: Either --api-key or --wallet is required');
+    console.error('\nRecommended: kova-node start --api-key YOUR_API_KEY');
+    console.error('Legacy: kova-node start --wallet YOUR_WALLET_ADDRESS');
+    console.error('\nGet your API key from https://test.kovanetwork.com/provider');
     process.exit(1);
   }
 
-  // validate wallet address format
-  if (!/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
+  // validate wallet address format if provided
+  if (walletAddress && !/^0x[a-fA-F0-9]{40}$/.test(walletAddress)) {
     console.error('\n❌ ERROR: Invalid wallet address format');
     console.error('Wallet address must be a valid Ethereum address (0x followed by 40 hex characters)');
     console.error(`Provided: ${walletAddress}`);
+    process.exit(1);
+  }
+
+  // validate api key format if provided
+  if (apiKey && !apiKey.startsWith('sk_live_')) {
+    console.error('\n❌ ERROR: Invalid API key format');
+    console.error('API key must start with sk_live_');
+    console.error(`Provided: ${apiKey.substring(0, 15)}...`);
     process.exit(1);
   }
 
@@ -129,15 +156,16 @@ export async function startNode(options: any) {
     await p2p.advertiseCapabilities(advertisedResources);
 
     // register with orchestrator via HTTP
-    const registrationResult = await registerWithOrchestrator(nodeId, advertisedResources, walletAddress, config.orchestratorUrl);
+    const registrationResult = await registerWithOrchestrator(nodeId, advertisedResources, apiKey, walletAddress, config.orchestratorUrl);
     const registered = !!registrationResult;
+    const effectiveWallet = registrationResult?.walletAddress || walletAddress;
 
     if (registered) {
       console.log('\n========================================');
       console.log('✓ KOVA NODE STARTED SUCCESSFULLY');
       console.log('========================================');
       console.log(`Node ID: ${nodeId}`);
-      console.log(`Wallet: ${walletAddress}`);
+      console.log(`Wallet: ${effectiveWallet}`);
       console.log(`\nAllocated Resources:`);
       console.log(`CPU: ${providerLimits.cpu} cores`);
       console.log(`Memory: ${providerLimits.memory} GB`);

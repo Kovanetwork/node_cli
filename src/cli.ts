@@ -23,7 +23,8 @@ program
 program
   .command('start')
   .description('start earning with your spare compute')
-  .requiredOption('-w, --wallet <address>', 'your ethereum wallet address')
+  .option('-k, --api-key <key>', 'your provider api key (get from dashboard)')
+  .option('-w, --wallet <address>', 'your ethereum wallet address (legacy)')
   .option('-p, --port <number>', 'p2p port', '4001')
   .option('-c, --config <path>', 'config file path')
   .option('--max-cpu <cores>', 'maximum CPU cores to allocate (default: all available)')
