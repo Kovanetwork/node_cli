@@ -1,0 +1,111 @@
+import { createLibp2p, Libp2p } from 'libp2p';
+import { tcp } from '@libp2p/tcp';
+import { noise } from '@chainsafe/libp2p-noise';
+import { yamux } from '@chainsafe/libp2p-yamux';
+import { bootstrap } from '@libp2p/bootstrap';
+import { kadDHT } from '@libp2p/kad-dht';
+import { identify } from '@libp2p/identify';
+import { gossipsub } from '@chainsafe/libp2p-gossipsub';
+import { EventEmitter } from 'events';
+import { logger } from './logger.js';
+
+export class P2PNode extends EventEmitter {
+  private node: Libp2p | null = null;
+  private port: number;
+  private bootstrapNodes: string[];
+  
+  constructor(options: { port: number; bootstrapNodes: string[] }) {
+    super();
+    this.port = options.port;
+    this.bootstrapNodes = options.bootstrapNodes || [
+      // some default bootstrap nodes when we have em
+      '/ip4/147.75.109.213/tcp/4001/p2p/QmNnooDu7bfjPFoTZYxMNLWUQJyrVwtbZg5gBMjTezGAJN'
+    ];
+  }
+  
+  async start() {
+    // alright lets build this p2p node
+    this.node = await createLibp2p({
+      addresses: {
+        listen: [`/ip4/0.0.0.0/tcp/${this.port}`]
+      },
+      transports: [tcp()],
+      connectionEncryption: [noise()],
+      streamMuxers: [yamux()],
+      peerDiscovery: this.bootstrapNodes.length ? [
+        bootstrap({ list: this.bootstrapNodes })
+      ] : [],
+      services: {
+        identify: identify() as any,
+        dht: kadDHT({
+          protocol: '/kova/kad/1.0.0'
+        }),
+        pubsub: gossipsub()
+      },
+      // identify needs these
+      identify: {
+        protocolPrefix: 'kova',
+        agentVersion: 'kova-node/0.0.1'
+      }
+    } as any);
+    
+    await this.node.start();
+    logger.info({ peerId: this.node.peerId.toString() }, 'p2p node started');
+
+    // subscribe to topics we care about
+    const pubsub = this.node.services.pubsub as any;
+    await pubsub.subscribe('kova.jobs.available');
+    await pubsub.subscribe('kova.nodes.announce');
+
+    // handle incoming messages
+    pubsub.addEventListener('message', (evt: any) => {
+      const topic = evt.detail.topic;
+      const msg = new TextDecoder().decode(evt.detail.data);
+
+      try {
+        const data = JSON.parse(msg);
+        if (topic === 'kova.jobs.available') {
+          this.emit('job-request', data);
+        }
+      } catch (err) {
+        // bad message whatever
+        logger.debug({ err, topic }, 'failed to parse message');
+      }
+    });
+  }
+  
+  async stop() {
+    if (this.node) {
+      await this.node.stop();
+      logger.info('p2p node stopped');
+    }
+  }
+  
+  async advertiseCapabilities(resources: any) {
+    if (!this.node) throw new Error('node not started');
+
+    const announcement = {
+      nodeId: this.node.peerId.toString(),
+      resources,
+      timestamp: Date.now(),
+      version: '0.0.1'
+    };
+
+    const pubsub = this.node.services.pubsub as any;
+    await pubsub.publish('kova.nodes.announce',
+      new TextEncoder().encode(JSON.stringify(announcement))
+    );
+
+    // also put in dht for discovery
+    const dht = this.node.services.dht as any;
+    await dht.put(
+      new TextEncoder().encode(`/kova/nodes/${this.node.peerId.toString()}`),
+      new TextEncoder().encode(JSON.stringify(resources))
+    );
+  }
+
+  getPeerId(): string {
+    if (!this.node) return 'unknown';
+    return this.node.peerId.toString();
+  }
+}
