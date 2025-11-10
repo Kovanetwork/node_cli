@@ -192,11 +192,35 @@ export async function startNode(options: any) {
     const containerMgr = new ContainerManager();
     await containerMgr.start();
 
-    const jobHandler = new JobHandler(p2p, containerMgr, limitManager);
+    const jobHandler = new JobHandler(p2p, containerMgr, limitManager, config.orchestratorUrl);
 
     // start api server for exec/logs
     const apiServer = new NodeAPIServer(containerMgr, 4002);
     await apiServer.start();
+
+    // listen for pending jobs from heartbeat
+    const processedJobs = new Set<string>();
+    if (heartbeat) {
+      heartbeat.on('pending-jobs', (jobs) => {
+        logger.info({ count: jobs.length }, 'processing pending jobs from heartbeat');
+        for (const job of jobs) {
+          // skip if already processed
+          if (processedJobs.has(job.id)) {
+            continue;
+          }
+          processedJobs.add(job.id);
+
+          jobHandler.handleJob(job).catch(err => {
+            logger.error({ err, jobId: job.id }, 'failed to handle job from heartbeat');
+          });
+        }
+      });
+
+      // clean up processed jobs set periodically
+      setInterval(() => {
+        processedJobs.clear();
+      }, 5 * 60 * 1000); // every 5 minutes
+    }
 
     // wire up earnings tracking
     jobHandler.on('job-completed', ({ jobId, earnings }) => {

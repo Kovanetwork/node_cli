@@ -25,12 +25,14 @@ export class JobHandler extends EventEmitter {
   private maxConcurrentJobs: number = 3;
   private usageMeter: UsageMeter;
   private limitManager: ResourceLimitManager;
+  private orchestratorUrl?: string;
 
-  constructor(p2pNode: P2PNode, containerManager: ContainerManager, limitManager: ResourceLimitManager) {
+  constructor(p2pNode: P2PNode, containerManager: ContainerManager, limitManager: ResourceLimitManager, orchestratorUrl?: string) {
     super();
     this.p2pNode = p2pNode;
     this.containerManager = containerManager;
     this.limitManager = limitManager;
+    this.orchestratorUrl = orchestratorUrl;
     this.usageMeter = new UsageMeter();
 
     this.setupContainerListeners();
@@ -173,28 +175,70 @@ export class JobHandler extends EventEmitter {
   }
   
   private async reportJobCompletion(jobId: string, job: JobExecution) {
-    const completionMessage = {
-      type: 'job-completed',
-      data: {
-        jobId,
-        success: job.status === 'completed',
-        result: job.result,
-        usage: {
+    const nodeId = this.p2pNode.getPeerId();
+
+    // try http callback first (more reliable than p2p)
+    if (this.orchestratorUrl) {
+      try {
+        await fetch(`${this.orchestratorUrl}/api/v1/nodes/${nodeId}/jobs/${jobId}/complete`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            success: job.status === 'completed',
+            result: job.result,
+            usage: {
+              runtime: job.endTime ? (job.endTime - job.startTime) / 1000 : 0,
+              cost: job.earnings || 0
+            }
+          })
+        });
+
+        logger.info({
+          jobId,
+          status: job.status,
           runtime: job.endTime ? (job.endTime - job.startTime) / 1000 : 0,
-          cost: job.earnings || 0
-        },
-        nodeId: this.p2pNode.getPeerId()
+          earnings: job.earnings
+        }, 'reported job completion via http');
+      } catch (err) {
+        logger.warn({ err, jobId }, 'failed to report via http, trying p2p');
+
+        // fallback to p2p
+        const completionMessage = {
+          type: 'job-completed',
+          data: {
+            jobId,
+            success: job.status === 'completed',
+            result: job.result,
+            usage: {
+              runtime: job.endTime ? (job.endTime - job.startTime) / 1000 : 0,
+              cost: job.earnings || 0
+            },
+            nodeId
+          }
+        };
+
+        await this.p2pNode.sendToOrchestrator(completionMessage);
+        logger.info({ jobId }, 'reported job completion via p2p');
       }
-    };
+    } else {
+      // no http url, use p2p only
+      const completionMessage = {
+        type: 'job-completed',
+        data: {
+          jobId,
+          success: job.status === 'completed',
+          result: job.result,
+          usage: {
+            runtime: job.endTime ? (job.endTime - job.startTime) / 1000 : 0,
+            cost: job.earnings || 0
+          },
+          nodeId
+        }
+      };
 
-    await this.p2pNode.sendToOrchestrator(completionMessage);
-
-    logger.info({
-      jobId,
-      status: job.status,
-      runtime: job.endTime ? (job.endTime - job.startTime) / 1000 : 0,
-      earnings: job.earnings
-    }, 'reported job completion to orchestrator');
+      await this.p2pNode.sendToOrchestrator(completionMessage);
+      logger.info({ jobId }, 'reported job completion via p2p');
+    }
 
     setTimeout(() => {
       this.activeJobs.delete(jobId);

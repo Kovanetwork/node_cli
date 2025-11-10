@@ -101,6 +101,12 @@ export class HeartbeatService extends EventEmitter {
           'heartbeat sent successfully'
         );
         this.emit('heartbeat-success', { resources, timestamp: data.timestamp || Date.now() });
+
+        // check if orchestrator sent pending jobs
+        if (data.pendingJobs && data.pendingJobs.length > 0) {
+          logger.info({ count: data.pendingJobs.length }, 'received pending jobs from heartbeat');
+          this.emit('pending-jobs', data.pendingJobs);
+        }
       } else {
         const error = await response.text();
         logger.warn(
