@@ -36,7 +36,7 @@ const schema = {
   orchestratorUrl: {
     doc: 'orchestrator API URL for registration',
     format: String,
-    default: 'https://test.kovanetwork.com',
+    default: 'https://orchestrator.kovanetwork.com',
     env: 'KOVA_ORCHESTRATOR_URL'
   },
   resources: {
