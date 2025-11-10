@@ -106,6 +106,38 @@ export class NodeAPIServer {
       }
     });
 
+    // proxy http requests to deployment containers
+    this.app.all('/deployments/:deploymentId/proxy', async (request: any, reply: any) => {
+      const { deploymentId } = request.params;
+      const targetPort = parseInt(request.headers['x-target-port'] || '80');
+
+      // get container for this deployment
+      const containerInfo = this.containerManager.getContainerInfo(deploymentId);
+      if (!containerInfo) {
+        return reply.code(404).send({ error: 'deployment not found' });
+      }
+
+      try {
+        // forward to container via docker network
+        // containers are accessible via their name on docker network
+        const containerHost = `172.17.0.1`; // docker host from inside container
+        const targetUrl = `http://${containerHost}:${targetPort}${request.url.replace(`/deployments/${deploymentId}/proxy`, '')}`;
+
+        // simple proxy - just exec curl inside the container
+        const curlCmd = `curl -X ${request.method} "${targetUrl}" ${
+          request.body ? `-d '${JSON.stringify(request.body)}'` : ''
+        }`;
+
+        const result = await this.containerManager.execInContainer(deploymentId, curlCmd);
+
+        reply.header('Content-Type', 'text/html');
+        return reply.send(result.stdout);
+      } catch (err: any) {
+        logger.error({ err, deploymentId }, 'proxy failed');
+        return reply.code(502).send({ error: 'proxy failed', message: err.message });
+      }
+    });
+
     // health check
     this.app.get('/health', async () => {
       return {
