@@ -2,6 +2,8 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { ContainerManager } from '../services/container-manager.js';
 import { logger } from '../lib/logger.js';
+import Docker from 'dockerode';
+import http from 'http';
 
 export class NodeAPIServer {
   private app: any;
@@ -119,7 +121,6 @@ export class NodeAPIServer {
 
         // containers on same docker network can access each other by name
         // or we can get container IP
-        const Docker = require('dockerode');
         const docker = new Docker();
 
         const containers = await docker.listContainers({
@@ -141,20 +142,26 @@ export class NodeAPIServer {
         }
 
         // proxy to container
-        const http = require('http');
         const targetUrl = `http://${containerIP}:${targetPort}${request.url.replace(`/deployments/${deploymentId}/proxy`, '')}`;
 
         logger.info({ targetUrl, deploymentId }, 'proxying request');
 
         const proxyReq = http.request(targetUrl, {
           method: request.method,
-          headers: request.headers
+          headers: {
+            ...request.headers,
+            host: `${containerIP}:${targetPort}`
+          }
         }, (proxyRes: any) => {
           reply.code(proxyRes.statusCode);
+
+          // copy all headers from container response
           Object.keys(proxyRes.headers).forEach(key => {
             reply.header(key, proxyRes.headers[key]);
           });
-          proxyRes.pipe(reply.raw);
+
+          // stream response directly
+          reply.send(proxyRes);
         });
 
         proxyReq.on('error', (err: any) => {
