@@ -2,6 +2,7 @@
 // handles multi-service deployments, persistent volumes, port exposure
 
 import { EventEmitter } from 'events';
+import { PassThrough } from 'stream';
 import { logger } from '../lib/logger.js';
 import Docker from 'dockerode';
 import { randomBytes } from 'crypto';
@@ -72,14 +73,33 @@ export class DeploymentExecutor extends EventEmitter {
     try {
       // create isolated network for this deployment
       const networkName = `kova-deploy-${deploymentId.slice(-8)}`;
-      const network = await this.docker.createNetwork({
-        Name: networkName,
-        Driver: 'bridge',
-        Internal: false
-      });
+      let network;
+
+      try {
+        network = await this.docker.createNetwork({
+          Name: networkName,
+          Driver: 'bridge',
+          Internal: false
+        });
+        logger.info({ deploymentId, networkName }, 'created deployment network');
+      } catch (err: any) {
+        if (err.statusCode === 409 || err.message?.includes('already exists')) {
+          // network already exists, get it
+          const networks = await this.docker.listNetworks({
+            filters: { name: [networkName] }
+          });
+          network = networks[0] ? this.docker.getNetwork(networks[0].Id) : null;
+          if (network) {
+            logger.info({ deploymentId, networkName }, 'using existing network');
+          } else {
+            throw new Error(`network ${networkName} exists but could not be retrieved`);
+          }
+        } else {
+          throw err;
+        }
+      }
 
       execution.networks.push(network.id);
-      logger.info({ deploymentId, networkName }, 'created deployment network');
 
       // create persistent volumes if needed
       for (const [serviceName, service] of Object.entries(manifest.services)) {
@@ -164,42 +184,55 @@ export class DeploymentExecutor extends EventEmitter {
 
     // create container
     const containerName = `kova-${deploymentId}-${serviceName}`;
+    let container;
+    let isExisting = false;
 
-    // cleanup any existing container with same name (from previous failed attempts)
+    // check if container already exists
     try {
       const existing = this.docker.getContainer(containerName);
-      await existing.remove({ force: true });
-      logger.info({ containerName }, 'removed existing container');
+      const info = await existing.inspect();
+
+      if (info.State.Running) {
+        // container is already running, reuse it
+        container = existing;
+        isExisting = true;
+        logger.info({ containerName, containerId: info.Id }, 'reusing existing running container');
+      } else {
+        // container exists but not running, remove and recreate
+        await existing.remove({ force: true });
+        logger.info({ containerName }, 'removed stopped container');
+      }
     } catch (err) {
-      // container doesn't exist, that's fine
+      // container doesn't exist, will create new one
     }
 
-    const container = await this.docker.createContainer({
-      name: containerName,
-      Image: service.image,
-      Env: env,
-      ExposedPorts: exposedPorts,
-      HostConfig: {
-        NetworkMode: networkName,
-        Binds: binds,
-        // no port bindings - containers only accessible via docker network
-        ReadonlyRootfs: false, // allow writes to mounted volumes
-        AutoRemove: false,
-        RestartPolicy: { Name: 'no' }
-      },
-      Labels: {
-        'kova.deployment': deploymentId,
-        'kova.service': serviceName,
-        'kova.lease': execution.leaseId
-      }
-    });
+    if (!isExisting) {
+      container = await this.docker.createContainer({
+        name: containerName,
+        Image: service.image,
+        Env: env,
+        ExposedPorts: exposedPorts,
+        HostConfig: {
+          NetworkMode: networkName,
+          Binds: binds,
+          // no port bindings - containers only accessible via docker network
+          ReadonlyRootfs: false, // allow writes to mounted volumes
+          AutoRemove: false,
+          RestartPolicy: { Name: 'no' }
+        },
+        Labels: {
+          'kova.deployment': deploymentId,
+          'kova.service': serviceName,
+          'kova.lease': execution.leaseId
+        }
+      });
 
-    // start container
-    await container.start();
+      // start container
+      await container.start();
+      logger.info({ deploymentId, serviceName, containerId: container.id }, 'service started');
+    }
 
     execution.containers.set(serviceName, container.id);
-
-    logger.info({ deploymentId, serviceName, containerId: container.id }, 'service started');
 
     // start streaming logs
     this.streamLogs(container, deploymentId, serviceName);
@@ -240,18 +273,39 @@ export class DeploymentExecutor extends EventEmitter {
       follow: true,
       stdout: true,
       stderr: true,
-      timestamps: true
+      timestamps: false
     }, (err: any, stream: any) => {
       if (err) {
         logger.error({ err }, 'failed to attach to container logs');
         return;
       }
 
-      stream.on('data', (chunk: Buffer) => {
-        const logLine = chunk.toString().trim();
+      // docker multiplexes stdout/stderr streams, need to demux
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+
+      container.modem.demuxStream(stream, stdout, stderr);
+
+      stdout.on('data', (chunk: Buffer) => {
+        const logLine = chunk.toString('utf8').trim();
         if (logLine) {
           this.emitLog(deploymentId, serviceName, logLine, 'stdout');
         }
+      });
+
+      stderr.on('data', (chunk: Buffer) => {
+        const logLine = chunk.toString('utf8').trim();
+        if (logLine) {
+          this.emitLog(deploymentId, serviceName, logLine, 'stderr');
+        }
+      });
+
+      stream.on('end', () => {
+        logger.info({ deploymentId, serviceName }, 'log stream ended');
+      });
+
+      stream.on('error', (err: any) => {
+        logger.error({ err, deploymentId, serviceName }, 'log stream error');
       });
     });
   }
