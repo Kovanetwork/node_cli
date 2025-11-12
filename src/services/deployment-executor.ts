@@ -20,6 +20,7 @@ interface Service {
     storage?: Record<string, {
       mount: string;
       readOnly?: boolean;
+      source?: 'uploads' | 'empty';  // uploads = fetch from orchestrator
     }>;
   };
 }
@@ -114,6 +115,15 @@ export class DeploymentExecutor extends EventEmitter {
 
             execution.volumes.push(volume.Name);
             logger.info({ deploymentId, volumeName: volumeFullName }, 'created persistent volume');
+
+            // if source is "uploads", download and populate volume
+            if (volumeConfig.source === 'uploads') {
+              await this.populateVolumeFromUploads(
+                deploymentId,
+                serviceName,
+                volumeFullName
+              );
+            }
           }
         }
       }
@@ -376,5 +386,260 @@ export class DeploymentExecutor extends EventEmitter {
   // get deployment info
   getDeployment(deploymentId: string): DeploymentExecution | undefined {
     return this.executions.get(deploymentId);
+  }
+
+  // discover existing deployments on startup
+  async discoverExistingDeployments(): Promise<void> {
+    logger.info('discovering existing kova deployments...');
+
+    try {
+      // find all containers with kova.deployment label
+      const containers = await this.docker.listContainers({
+        filters: { label: ['kova.deployment'] }
+      });
+
+      for (const containerInfo of containers) {
+        const deploymentId = containerInfo.Labels['kova.deployment'];
+        const serviceName = containerInfo.Labels['kova.service'] || 'web';
+
+        if (!deploymentId) continue;
+
+        // skip if already tracked
+        if (this.executions.has(deploymentId)) continue;
+
+        logger.info({ deploymentId, serviceName, containerId: containerInfo.Id }, 'discovered existing deployment');
+
+        // get full container details
+        const container = this.docker.getContainer(containerInfo.Id);
+        const inspect = await container.inspect();
+
+        // extract volumes from mounts
+        const volumes: string[] = [];
+        for (const mount of inspect.Mounts || []) {
+          if (mount.Type === 'volume' && mount.Name) {
+            volumes.push(mount.Name);
+          }
+        }
+
+        // extract network
+        const networks = Object.keys(inspect.NetworkSettings.Networks || {});
+        const networkId = networks.length > 0 ? inspect.NetworkSettings.Networks[networks[0]].NetworkID : '';
+
+        // create execution record
+        const execution: DeploymentExecution = {
+          deploymentId,
+          leaseId: containerInfo.Labels['kova.lease'] || '',
+          manifest: {
+            version: '2.0',
+            services: {},
+            profiles: {},
+            deployment: {}
+          },
+          containers: new Map([[serviceName, containerInfo.Id]]),
+          volumes,
+          networks: networkId ? [networkId] : []
+        };
+
+        this.executions.set(deploymentId, execution);
+
+        // start streaming logs from discovered container
+        try {
+          const container = this.docker.getContainer(containerInfo.Id);
+          this.streamLogs(container, deploymentId, serviceName);
+          logger.info({ deploymentId, serviceName }, 'log streaming attached to discovered container');
+        } catch (err) {
+          logger.warn({ err, deploymentId }, 'failed to attach log streaming to discovered container');
+        }
+
+        logger.info({ deploymentId, volumes: volumes.length }, 'deployment state restored');
+      }
+
+      logger.info({ count: this.executions.size }, 'deployment discovery complete');
+    } catch (err) {
+      logger.error({ err }, 'failed to discover existing deployments');
+    }
+  }
+
+  // download and populate volume with uploaded files from orchestrator
+  private async populateVolumeFromUploads(
+    deploymentId: string,
+    serviceName: string,
+    volumeName: string
+  ): Promise<void> {
+    const https = await import('https');
+    const http = await import('http');
+    const fs = await import('fs');
+    const tar = await import('tar');
+    const path = await import('path');
+    const os = await import('os');
+
+    logger.info({ deploymentId, serviceName, volumeName }, 'downloading files from orchestrator');
+
+    // get orchestrator URL from config
+    const orchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:3000';
+    const downloadUrl = `${orchestratorUrl}/api/v1/deployments/${deploymentId}/services/${serviceName}/files/download`;
+
+    // get provider token from config
+    const providerToken = process.env.PROVIDER_TOKEN || '';
+
+    try {
+      // download tarball to temp file
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kova-download-'));
+      const tarballPath = path.join(tempDir, 'files.tar.gz');
+
+      await new Promise<void>((resolve, reject) => {
+        const proto = orchestratorUrl.startsWith('https') ? https : http;
+
+        const req = proto.get(downloadUrl, {
+          headers: {
+            'Authorization': `Bearer ${providerToken}`
+          }
+        }, (res) => {
+          if (res.statusCode === 404) {
+            // no files uploaded, skip
+            logger.info({ deploymentId, serviceName }, 'no uploaded files found, skipping');
+            resolve();
+            return;
+          }
+
+          if (res.statusCode !== 200) {
+            reject(new Error(`Failed to download files: ${res.statusCode} ${res.statusMessage}`));
+            return;
+          }
+
+          const fileStream = fs.createWriteStream(tarballPath);
+          res.pipe(fileStream);
+          fileStream.on('finish', () => {
+            fileStream.close();
+            resolve();
+          });
+          fileStream.on('error', reject);
+        });
+
+        req.on('error', reject);
+        req.end();
+      });
+
+      // check if tarball was downloaded
+      if (!fs.existsSync(tarballPath)) {
+        logger.info({ deploymentId, serviceName }, 'no files to populate volume');
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        return;
+      }
+
+      // extract tarball to temp directory
+      const extractDir = path.join(tempDir, 'extracted');
+      fs.mkdirSync(extractDir, { recursive: true });
+
+      await tar.extract({
+        file: tarballPath,
+        cwd: extractDir
+      });
+
+      // copy files to volume using a temporary container
+      // mount volume and copy files from temp directory
+      const containerName = `kova-temp-copy-${Date.now()}`;
+
+      await this.docker.run(
+        'alpine:latest',
+        ['sh', '-c', `cp -r /source/. /dest/`],
+        process.stdout,
+        {
+          name: containerName,
+          HostConfig: {
+            Binds: [
+              `${volumeName}:/dest`,
+              `${extractDir}:/source:ro`
+            ],
+            AutoRemove: true
+          }
+        }
+      );
+
+      logger.info({ deploymentId, serviceName, volumeName }, 'files populated to volume');
+
+      // cleanup temp directory
+      fs.rmSync(tempDir, { recursive: true, force: true });
+    } catch (err) {
+      logger.error({ err, deploymentId, serviceName }, 'failed to populate volume from uploads');
+      throw err;
+    }
+  }
+
+  // update files in existing deployment volume and restart containers
+  async updateDeploymentFiles(deploymentId: string, serviceName: string): Promise<void> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      throw new Error('deployment not found');
+    }
+
+    logger.info({ deploymentId, serviceName }, 'updating deployment files');
+
+    // find the volume for this service (could be -uploads, -html, or other name)
+    const volumePrefix = `kova-${deploymentId}-${serviceName}-`;
+    const volumeName = execution.volumes.find(v => v && v.startsWith(volumePrefix));
+
+    if (!volumeName) {
+      throw new Error(`no volume found for service ${serviceName} (expected prefix: ${volumePrefix})`);
+    }
+
+    logger.info({ deploymentId, serviceName, volumeName }, 'found volume for update');
+
+    // stop containers for this service
+    const containerId = execution.containers.get(serviceName);
+    if (containerId) {
+      try {
+        const container = this.docker.getContainer(containerId);
+        await container.stop({ t: 10 });
+        logger.info({ deploymentId, serviceName, containerId }, 'container stopped for file update');
+      } catch (err) {
+        logger.warn({ err, containerId }, 'failed to stop container');
+      }
+    }
+
+    try {
+      // clear volume contents using temporary container
+      await this.docker.run(
+        'alpine:latest',
+        ['sh', '-c', 'rm -rf /dest/*'],
+        process.stdout,
+        {
+          HostConfig: {
+            Binds: [`${volumeName}:/dest`],
+            AutoRemove: true
+          }
+        }
+      );
+
+      logger.info({ deploymentId, serviceName, volumeName }, 'volume contents cleared');
+
+      // re-download and populate volume
+      await this.populateVolumeFromUploads(deploymentId, serviceName, volumeName);
+
+      // restart container
+      if (containerId) {
+        try {
+          const container = this.docker.getContainer(containerId);
+          await container.start();
+          logger.info({ deploymentId, serviceName, containerId }, 'container restarted after file update');
+        } catch (err) {
+          logger.error({ err, containerId }, 'failed to restart container after file update');
+          throw err;
+        }
+      }
+
+      logger.info({ deploymentId, serviceName }, 'deployment files updated successfully');
+    } catch (err) {
+      // try to restart container even if update failed
+      if (containerId) {
+        try {
+          const container = this.docker.getContainer(containerId);
+          await container.start();
+        } catch (restartErr) {
+          logger.error({ err: restartErr }, 'failed to restart container after failed update');
+        }
+      }
+      throw err;
+    }
   }
 }

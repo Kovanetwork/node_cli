@@ -17,6 +17,7 @@ interface Lease {
   pricePerBlock: number;
   manifest: any;
   manifestVersion: string;
+  filesVersion: number;
   state: string;
 }
 
@@ -25,6 +26,7 @@ export class LeaseHandler {
   private executor: DeploymentExecutor;
   private pollingInterval: NodeJS.Timeout | null = null;
   private activeLeases: Set<string> = new Set();
+  private filesVersions: Map<string, number> = new Map(); // track files_version per deployment
 
   constructor(config: LeaseHandlerConfig, executor: DeploymentExecutor) {
     this.config = config;
@@ -86,15 +88,57 @@ export class LeaseHandler {
       const myLeases = leases.filter(l => l.nodeId === this.config.nodeId);
 
       for (const lease of myLeases) {
-        // check if we're already running this deployment
-        if (this.activeLeases.has(lease.deploymentId)) {
+        const deploymentRunning = this.executor.getDeployment(lease.deploymentId);
+
+        // check if deployment is already running (either we started it or discovered it)
+        if (deploymentRunning) {
+          // track this as active
+          this.activeLeases.add(lease.deploymentId);
+
+          // check if files_version changed (files updated)
+          const lastKnownVersion = this.filesVersions.get(lease.deploymentId);
+          const currentVersion = lease.filesVersion || 0;
+
+          // if we don't have a tracked version yet (discovered deployment), initialize it
+          if (lastKnownVersion === undefined) {
+            this.filesVersions.set(lease.deploymentId, currentVersion);
+            logger.info({ deploymentId: lease.deploymentId, filesVersion: currentVersion }, 'initialized files_version for existing deployment');
+            continue;
+          }
+
+          // check for updates
+          if (currentVersion > lastKnownVersion) {
+            logger.info({
+              deploymentId: lease.deploymentId,
+              oldVersion: lastKnownVersion,
+              newVersion: currentVersion
+            }, 'files updated - syncing changes');
+
+            try {
+              // update files for this deployment
+              // assume 'web' service for now (could parse manifest for service names)
+              await this.executor.updateDeploymentFiles(lease.deploymentId, 'web');
+
+              // update tracked version
+              this.filesVersions.set(lease.deploymentId, currentVersion);
+
+              logger.info({ deploymentId: lease.deploymentId }, 'files synced successfully');
+            } catch (err) {
+              logger.error({ err, deploymentId: lease.deploymentId }, 'failed to sync files');
+            }
+          }
+
           continue;
         }
 
         logger.info({ leaseId: lease.id, deploymentId: lease.deploymentId }, 'new lease assigned');
 
-        // execute deployment
+        // execute deployment (will download files at current version)
         await this.executeDeployment(lease);
+
+        // track files_version only AFTER successful deployment
+        // this ensures we don't miss updates that happened before we started
+        this.filesVersions.set(lease.deploymentId, lease.filesVersion || 0);
       }
     } catch (err) {
       logger.debug({ err }, 'lease polling error');

@@ -1,6 +1,7 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import { ContainerManager } from '../services/container-manager.js';
+import { DeploymentExecutor } from '../services/deployment-executor.js';
 import { logger } from '../lib/logger.js';
 import Docker from 'dockerode';
 import http from 'http';
@@ -8,10 +9,12 @@ import http from 'http';
 export class NodeAPIServer {
   private app: any;
   private containerManager: ContainerManager;
+  private deploymentExecutor?: DeploymentExecutor;
   private port: number;
 
-  constructor(containerManager: ContainerManager, port: number = 4002) {
+  constructor(containerManager: ContainerManager, deploymentExecutor?: DeploymentExecutor, port: number = 4002) {
     this.containerManager = containerManager;
+    this.deploymentExecutor = deploymentExecutor;
     this.port = port;
   }
 
@@ -178,6 +181,29 @@ export class NodeAPIServer {
       } catch (err: any) {
         logger.error({ err, deploymentId }, 'proxy setup failed');
         return reply.code(502).send({ error: 'proxy failed', message: err.message });
+      }
+    });
+
+    // update deployment files
+    this.app.post('/deployments/:deploymentId/services/:serviceName/update-files', async (request: any, reply: any) => {
+      const { deploymentId, serviceName } = request.params;
+
+      if (!this.deploymentExecutor) {
+        return reply.code(503).send({ error: 'deployment executor not available' });
+      }
+
+      try {
+        await this.deploymentExecutor.updateDeploymentFiles(deploymentId, serviceName);
+        return {
+          success: true,
+          message: 'files updated and deployment restarted'
+        };
+      } catch (err: any) {
+        logger.error({ err, deploymentId, serviceName }, 'failed to update deployment files');
+        return reply.code(500).send({
+          error: 'failed to update files',
+          message: err.message
+        });
       }
     });
 

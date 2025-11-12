@@ -194,8 +194,19 @@ export async function startNode(options: any) {
 
     const jobHandler = new JobHandler(p2p, containerMgr, limitManager, config.orchestratorUrl);
 
-    // start api server for exec/logs
-    const apiServer = new NodeAPIServer(containerMgr, 4002);
+    // initialize deployment executor early if orchestrator configured
+    let deploymentExecutor: DeploymentExecutor | null = null;
+    if (config.orchestratorUrl && registered && registrationResult) {
+      deploymentExecutor = new DeploymentExecutor();
+
+      // discover any existing deployments from previous runs
+      await deploymentExecutor.discoverExistingDeployments();
+
+      logger.info('deployment executor initialized');
+    }
+
+    // start api server for exec/logs (with deployment executor if available)
+    const apiServer = new NodeAPIServer(containerMgr, deploymentExecutor || undefined, 4002);
     await apiServer.start();
 
     // listen for pending jobs from heartbeat
@@ -252,7 +263,6 @@ export async function startNode(options: any) {
     // new deployment system
     let autoBidder: AutoBidder | null = null;
     let leaseHandler: LeaseHandler | null = null;
-    let deploymentExecutor: DeploymentExecutor | null = null;
 
     if (config.orchestratorUrl && registered && registrationResult) {
       // use provider id from registration
@@ -272,9 +282,7 @@ export async function startNode(options: any) {
         logger.warn('failed to verify provider account');
       }
 
-      // setup deployment executor
-      deploymentExecutor = new DeploymentExecutor();
-
+      // deployment executor already initialized above
       // setup auto-bidder for competitive bidding
       autoBidder = new AutoBidder({
         nodeId,
@@ -291,6 +299,10 @@ export async function startNode(options: any) {
       logger.info({ nodeId }, 'auto-bidder started - will bid on suitable orders');
 
       // setup lease handler
+      if (!deploymentExecutor) {
+        throw new Error('deployment executor not initialized');
+      }
+
       leaseHandler = new LeaseHandler({
         nodeId,
         providerId,
