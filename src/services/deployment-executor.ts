@@ -575,9 +575,28 @@ export class DeploymentExecutor extends EventEmitter {
 
     logger.info({ deploymentId, serviceName }, 'updating deployment files');
 
-    // find the volume for this service (could be -uploads, -html, or other name)
+    // find volume for this service
     const volumePrefix = `kova-${deploymentId}-${serviceName}-`;
-    const volumeName = execution.volumes.find(v => v && v.startsWith(volumePrefix));
+
+    let volumeName = execution.volumes.find(v => v && v.startsWith(volumePrefix));
+
+    // check docker if not in memory
+    if (!volumeName) {
+      logger.info({ deploymentId, serviceName, volumePrefix }, 'volume not in memory, querying docker');
+
+      try {
+        const volumes = await this.docker.listVolumes();
+        const matchingVolume = volumes.Volumes?.find(v => v.Name?.startsWith(volumePrefix));
+
+        if (matchingVolume) {
+          volumeName = matchingVolume.Name;
+          execution.volumes.push(volumeName);
+          logger.info({ deploymentId, serviceName, volumeName }, 'found existing volume in docker');
+        }
+      } catch (err) {
+        logger.error({ err, deploymentId, serviceName }, 'failed to query docker volumes');
+      }
+    }
 
     if (!volumeName) {
       throw new Error(`no volume found for service ${serviceName} (expected prefix: ${volumePrefix})`);
