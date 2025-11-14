@@ -9,6 +9,8 @@ import { randomBytes } from 'crypto';
 
 interface Service {
   image: string;
+  command?: string[];  // docker cmd override
+  args?: string[];     // docker entrypoint args
   env?: string[] | Record<string, string>;
   expose?: Array<{
     port: number;
@@ -217,7 +219,8 @@ export class DeploymentExecutor extends EventEmitter {
     }
 
     if (!isExisting) {
-      container = await this.docker.createContainer({
+      // build container config with command/args support
+      const containerConfig: any = {
         name: containerName,
         Image: service.image,
         Env: env,
@@ -235,7 +238,21 @@ export class DeploymentExecutor extends EventEmitter {
           'kova.service': serviceName,
           'kova.lease': execution.leaseId
         }
-      });
+      };
+
+      // add command override if specified (docker CMD)
+      if (service.command && service.command.length > 0) {
+        containerConfig.Cmd = service.command;
+        logger.info({ deploymentId, serviceName, command: service.command }, 'using custom command');
+      }
+
+      // add entrypoint args if specified
+      if (service.args && service.args.length > 0) {
+        containerConfig.Entrypoint = service.args;
+        logger.info({ deploymentId, serviceName, args: service.args }, 'using custom entrypoint');
+      }
+
+      container = await this.docker.createContainer(containerConfig);
 
       // start container
       await container.start();

@@ -24,6 +24,7 @@ interface AutoBidderConfig {
   nodeId: string;
   providerId: string;
   orchestratorUrl: string;
+  apiKey: string;  // provider api key for authentication
   pricingStrategy: {
     cpuPricePerCore: number;  // per core per block
     memoryPricePerGb: number; // per gb per block
@@ -35,6 +36,7 @@ export class AutoBidder {
   private config: AutoBidderConfig;
   private monitor: ResourceMonitor;
   private pollingInterval: NodeJS.Timeout | null = null;
+  private submittedBids: Set<string> = new Set();  // track orders we've already bid on
 
   constructor(config: AutoBidderConfig, monitor: ResourceMonitor) {
     this.config = config;
@@ -76,12 +78,13 @@ export class AutoBidder {
       // fetch open orders from orchestrator
       const response = await fetch(`${this.config.orchestratorUrl}/api/v1/provider/orders`, {
         headers: {
-          'Authorization': `Bearer ${await this.getToken()}`
+          'Authorization': `Bearer ${this.config.apiKey}`
         }
       });
 
       if (!response.ok) {
-        logger.debug('failed to fetch orders');
+        const error = await response.text();
+        logger.error({ status: response.status, error }, 'failed to fetch orders from orchestrator');
         return;
       }
 
@@ -89,10 +92,27 @@ export class AutoBidder {
       const orders: Order[] = data.orders || [];
 
       if (orders.length === 0) {
+        logger.debug('no open orders available');
         return;
       }
 
-      logger.debug({ count: orders.length }, 'found open orders');
+      logger.info({ count: orders.length }, 'found open orders - evaluating for bidding');
+
+      // log the order ids and timestamps for debugging
+      for (const order of orders) {
+        // order id format: userId-timestamp-serviceIndex
+        // e.g. 9d4a6656-02c8-4e16-a4c3-910efe92e7e2-1763050326342-1
+        const parts = order.id.split('-');
+        const orderTimestamp = parseInt(parts[parts.length - 2] || '0');
+        const age = Date.now() - orderTimestamp;
+        const ageInHours = Math.floor(age / (1000 * 60 * 60));
+        logger.debug({
+          orderId: order.id,
+          timestamp: orderTimestamp,
+          ageInHours,
+          alreadyBid: this.submittedBids.has(order.id)
+        }, 'order details');
+      }
 
       // evaluate each order
       for (const order of orders) {
@@ -105,10 +125,29 @@ export class AutoBidder {
 
   // evaluate order and submit bid if suitable
   private async evaluateAndBid(order: Order): Promise<void> {
+    // skip if we already bid on this order
+    if (this.submittedBids.has(order.id)) {
+      logger.info({ orderId: order.id }, 'skipping - already bid in this session');
+      return;
+    }
+
+    // skip old orders (more than 7 days)
+    // order id format: userId-timestamp-serviceIndex
+    const parts = order.id.split('-');
+    const orderTimestamp = parseInt(parts[parts.length - 2] || '0');
+    const now = Date.now();
+    const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
+    if (orderTimestamp < sevenDaysAgo) {
+      logger.info({ orderId: order.id, ageInDays: Math.floor((now - orderTimestamp) / (1000 * 60 * 60 * 24)) }, 'skipping - order too old');
+      return;
+    }
+
+    logger.info({ orderId: order.id }, 'evaluating order');
+
     // check if we can handle this order
     const canHandle = await this.canHandleOrder(order);
     if (!canHandle) {
-      logger.debug({ orderId: order.id }, 'cannot handle order - insufficient resources');
+      logger.info({ orderId: order.id, required: order.resources }, 'cannot handle order - insufficient resources');
       return;
     }
 
@@ -123,7 +162,7 @@ export class AutoBidder {
 
     // check if our price is competitive
     if (ourPrice > order.maxPricePerBlock) {
-      logger.debug({ orderId: order.id, ourPrice, maxPrice: order.maxPricePerBlock }, 'our price too high');
+      logger.info({ orderId: order.id, ourPrice, maxPrice: order.maxPricePerBlock }, 'our price too high');
       return;
     }
 
@@ -132,9 +171,13 @@ export class AutoBidder {
     // submit bid
     try {
       await this.submitBid(order.id, ourPrice);
+      // only add to set after successful bid
+      this.submittedBids.add(order.id);
+      logger.info({ orderId: order.id }, 'bid successful');
     } catch (err: any) {
-      if (err.message?.includes('already bid')) {
-        // we already bid on this, skip
+      if (err.message === 'already bid') {
+        // we already bid on this in a previous run, remember it silently
+        this.submittedBids.add(order.id);
         return;
       }
       logger.error({ err, orderId: order.id }, 'failed to submit bid');
@@ -148,12 +191,22 @@ export class AutoBidder {
     // check cpu
     const requiredCpu = order.resources.cpu;
     if (resources.cpu.available < requiredCpu) {
+      logger.info({
+        orderId: order.id,
+        required: requiredCpu,
+        available: resources.cpu.available
+      }, 'insufficient cpu');
       return false;
     }
 
     // check memory (convert to GB)
     const requiredMemory = this.parseMemoryToGb(order.resources.memory);
     if (resources.memory.available < requiredMemory) {
+      logger.info({
+        orderId: order.id,
+        requiredMemory,
+        availableMemory: resources.memory.available
+      }, 'insufficient memory');
       return false;
     }
 
@@ -176,13 +229,13 @@ export class AutoBidder {
     // add margin
     let price = baseCost * this.config.pricingStrategy.margin;
 
-    // minimum bid of 1 to ensure non-zero pricing
-    if (price < 1) {
-      price = 1;
+    // minimum bid to ensure non-zero pricing
+    if (price < 0.001) {
+      price = 0.001;
     }
 
-    // round to 2 decimals
-    return Math.round(price * 100) / 100;
+    // round to 4 decimals for precision
+    return Math.round(price * 10000) / 10000;
   }
 
   // submit bid to orchestrator
@@ -199,7 +252,7 @@ export class AutoBidder {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${await this.getToken()}`
+        'Authorization': `Bearer ${this.config.apiKey}`
       },
       body: JSON.stringify(bidData)
     });
@@ -209,6 +262,12 @@ export class AutoBidder {
       logger.info({ orderId, pricePerBlock, bidId: data.bid.id }, 'bid submitted');
     } else {
       const error: any = await response.json();
+      // check if we already bid on this order
+      if (error.message?.includes('already bid')) {
+        // throw this specific error so evaluateAndBid can track it
+        throw new Error('already bid');
+      }
+      // only log other errors
       logger.error({ orderId, status: response.status, error }, 'bid api error');
       throw new Error(error.message || error.error || 'bid submission failed');
     }
@@ -232,20 +291,4 @@ export class AutoBidder {
     return value * (multipliers[unit] || 1);
   }
 
-  // get authentication token for provider
-  private async getToken(): Promise<string> {
-    // for now, use test token
-    // in production, provider would authenticate with wallet
-    const response = await fetch(`${this.config.orchestratorUrl}/api/v1/auth/test-token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId: this.config.providerId,
-        role: 'provider'
-      })
-    });
-
-    const data: any = await response.json();
-    return data.token;
-  }
 }

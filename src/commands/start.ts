@@ -181,9 +181,9 @@ export async function startNode(options: any) {
     // start heartbeat service to keep orchestrator updated
     let heartbeat: HeartbeatService | null = null;
     if (config.orchestratorUrl) {
-      heartbeat = new HeartbeatService(nodeId, config.orchestratorUrl, monitor, limitManager, 10);
+      heartbeat = new HeartbeatService(nodeId, config.orchestratorUrl, monitor, limitManager, 60);
       await heartbeat.start();
-      logger.info('heartbeat service started - sending status every 10 seconds');
+      logger.info('heartbeat service started - sending status every 60 seconds');
     } else {
       logger.warn('no orchestrator URL configured - heartbeat disabled');
     }
@@ -288,6 +288,7 @@ export async function startNode(options: any) {
         nodeId,
         providerId,
         orchestratorUrl: config.orchestratorUrl,
+        apiKey,  // pass the api key for authentication
         pricingStrategy: {
           cpuPricePerCore: 0.00017,  // ~$0.01 per core per hour
           memoryPricePerGb: 0.00008, // ~$0.005 per GB per hour
