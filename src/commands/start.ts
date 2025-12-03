@@ -150,7 +150,8 @@ export async function startNode(options: any) {
         available: providerLimits.memory
       },
       disk: systemResources.disk,
-      network: systemResources.network
+      network: systemResources.network,
+      gpu: systemResources.gpu || []
     };
 
     await p2p.advertiseCapabilities(advertisedResources);
@@ -292,6 +293,7 @@ export async function startNode(options: any) {
         pricingStrategy: {
           cpuPricePerCore: 0.00017,  // ~$0.01 per core per hour
           memoryPricePerGb: 0.00008, // ~$0.005 per GB per hour
+          gpuPricePerUnit: 0.01,     // ~$0.60 per gpu per hour
           margin: 0.9                // bid 10% below cost to win
         }
       }, monitor);

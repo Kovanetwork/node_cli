@@ -114,8 +114,19 @@ export class P2PNode extends EventEmitter {
         this.emit('job-cancel', message.data);
         break;
 
+      case 'deployment-manifest':
+        this.emit('deployment-manifest', message.data);
+        break;
+
+      case 'deployment-close':
+        this.emit('deployment-close', message.data);
+        break;
+
+      case 'deployment-paused':
+        this.emit('deployment-paused', message.data);
+        break;
+
       case 'node-announcement':
-        // ignore announcements from other nodes
         break;
 
       default:

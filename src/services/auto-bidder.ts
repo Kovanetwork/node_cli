@@ -28,6 +28,7 @@ interface AutoBidderConfig {
   pricingStrategy: {
     cpuPricePerCore: number;  // per core per block
     memoryPricePerGb: number; // per gb per block
+    gpuPricePerUnit: number;  // per gpu per block
     margin: number;            // profit margin multiplier
   };
 }
@@ -210,7 +211,55 @@ export class AutoBidder {
       return false;
     }
 
-    // TODO: check disk, gpu if required
+    // check gpu if required
+    if (order.resources.gpu && order.resources.gpu.units > 0) {
+      const requiredGpuUnits = order.resources.gpu.units;
+      const requiredVendor = order.resources.gpu.attributes?.vendor;
+      const requiredRam = order.resources.gpu.attributes?.ram;
+
+      const availableGpus = resources.gpu || [];
+
+      if (availableGpus.length < requiredGpuUnits) {
+        logger.info({
+          orderId: order.id,
+          requiredGpuUnits,
+          availableGpus: availableGpus.length
+        }, 'insufficient gpu count');
+        return false;
+      }
+
+      // check vendor requirement if specified
+      if (requiredVendor) {
+        const vendorKey = Object.keys(requiredVendor)[0]?.toLowerCase();
+        const matchingGpus = availableGpus.filter((g: any) =>
+          g.vendor.includes(vendorKey)
+        );
+
+        if (matchingGpus.length < requiredGpuUnits) {
+          logger.info({
+            orderId: order.id,
+            requiredVendor: vendorKey,
+            matchingGpus: matchingGpus.length
+          }, 'no matching gpu vendor');
+          return false;
+        }
+
+        // check vram requirement if specified
+        if (requiredRam) {
+          const requiredVram = this.parseMemoryToGb(requiredRam);
+          const sufficientGpus = matchingGpus.filter((g: any) => g.vram >= requiredVram);
+
+          if (sufficientGpus.length < requiredGpuUnits) {
+            logger.info({
+              orderId: order.id,
+              requiredVram,
+              availableVram: matchingGpus.map((g: any) => g.vram)
+            }, 'insufficient gpu vram');
+            return false;
+          }
+        }
+      }
+    }
 
     return true;
   }
@@ -224,7 +273,14 @@ export class AutoBidder {
     const cpuCost = cpu * this.config.pricingStrategy.cpuPricePerCore;
     const memoryCost = memory * this.config.pricingStrategy.memoryPricePerGb;
 
-    const baseCost = cpuCost + memoryCost;
+    // gpu cost if required
+    let gpuCost = 0;
+    if (order.resources.gpu && order.resources.gpu.units > 0) {
+      const gpuPricePerUnit = this.config.pricingStrategy.gpuPricePerUnit || 0.1;
+      gpuCost = order.resources.gpu.units * gpuPricePerUnit;
+    }
+
+    const baseCost = cpuCost + memoryCost + gpuCost;
 
     // add margin
     let price = baseCost * this.config.pricingStrategy.margin;

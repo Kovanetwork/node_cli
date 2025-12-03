@@ -23,13 +23,24 @@ export class ResourceMonitor {
   
   private async collectStats() {
     try {
-      const [cpu, mem, disk, net] = await Promise.all([
+      const [cpu, mem, disk, net, graphics] = await Promise.all([
         si.currentLoad(),
         si.mem(),
         si.fsSize(),
-        si.networkStats()
+        si.networkStats(),
+        si.graphics()
       ]);
-      
+
+      // collect gpu info
+      const gpus = graphics.controllers
+        .filter((g: any) => g.vram > 0)  // only real gpus with vram
+        .map((g: any) => ({
+          vendor: g.vendor?.toLowerCase() || 'unknown',
+          model: g.model || 'unknown',
+          vram: Math.round(g.vram / 1024),  // convert to gb
+          bus: g.bus || 'pci'
+        }));
+
       this.lastStats = {
         cpu: {
           usage: cpu.currentLoad,
@@ -50,9 +61,10 @@ export class ResourceMonitor {
           rx: net[0]?.rx_sec || 0,
           tx: net[0]?.tx_sec || 0
         },
+        gpu: gpus,
         timestamp: Date.now()
       };
-      
+
       logger.debug(this.lastStats, 'collected system stats');
     } catch (err) {
       logger.error({ err }, 'failed to collect stats');
@@ -95,7 +107,8 @@ export class ResourceMonitor {
       network: {
         // just report what we got
         bandwidth: Math.round((stats.network.rx + stats.network.tx) / 125000) // mbps
-      }
+      },
+      gpu: stats.gpu || []
     };
   }
   

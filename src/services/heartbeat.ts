@@ -75,7 +75,8 @@ export class HeartbeatService extends EventEmitter {
           available: availableLimits.memory
         },
         disk: systemResources.disk,
-        network: systemResources.network
+        network: systemResources.network,
+        gpu: systemResources.gpu || []
       };
 
       // send heartbeat to orchestrator

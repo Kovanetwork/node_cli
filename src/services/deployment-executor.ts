@@ -27,6 +27,15 @@ interface Service {
   };
 }
 
+interface GpuConfig {
+  units: number;
+  attributes?: {
+    vendor?: Record<string, any>;
+    ram?: string;
+    interface?: string;
+  };
+}
+
 interface SDL {
   version: string;
   services: Record<string, Service>;
@@ -132,7 +141,18 @@ export class DeploymentExecutor extends EventEmitter {
 
       // start each service
       for (const [serviceName, service] of Object.entries(manifest.services)) {
-        await this.startService(deploymentId, serviceName, service, execution, networkName);
+        // extract gpu config from profiles if available
+        let gpu: GpuConfig | undefined;
+        if (manifest.profiles?.compute) {
+          // find matching compute profile for this service
+          for (const [profileName, profile] of Object.entries<any>(manifest.profiles.compute)) {
+            if (profile.resources?.gpu) {
+              gpu = profile.resources.gpu;
+              break;
+            }
+          }
+        }
+        await this.startService(deploymentId, serviceName, service, execution, networkName, gpu);
       }
 
       this.emit('deployment-started', { deploymentId, leaseId });
@@ -150,7 +170,8 @@ export class DeploymentExecutor extends EventEmitter {
     serviceName: string,
     service: Service,
     execution: DeploymentExecution,
-    networkName: string
+    networkName: string,
+    gpu?: GpuConfig
   ): Promise<void> {
     logger.info({ deploymentId, serviceName, image: service.image }, 'starting service');
 
@@ -239,6 +260,18 @@ export class DeploymentExecutor extends EventEmitter {
           'kova.lease': execution.leaseId
         }
       };
+
+      // add gpu device request if specified
+      if (gpu && gpu.units > 0) {
+        containerConfig.HostConfig.DeviceRequests = [{
+          Driver: '',
+          Count: gpu.units,
+          DeviceIDs: [],
+          Capabilities: [['gpu']],
+          Options: {}
+        }];
+        logger.info({ deploymentId, serviceName, gpuUnits: gpu.units }, 'requesting gpu access');
+      }
 
       // add command override if specified (docker CMD)
       if (service.command && service.command.length > 0) {
