@@ -2,7 +2,7 @@
 // handles multi-service deployments, persistent volumes, port exposure
 
 import { EventEmitter } from 'events';
-import { PassThrough } from 'stream';
+import { PassThrough, Readable, Writable } from 'stream';
 import { logger } from '../lib/logger.js';
 import Docker from 'dockerode';
 import { randomBytes } from 'crypto';
@@ -159,7 +159,7 @@ export class DeploymentExecutor extends EventEmitter {
       logger.info({ deploymentId, services: execution.containers.size }, 'deployment running');
     } catch (err) {
       logger.error({ err, deploymentId }, 'deployment execution failed');
-      await this.cleanupDeployment(deploymentId);
+      await this.cleanupDeployment(deploymentId, true); // cleanup all resources on failure
       throw err;
     }
   }
@@ -381,7 +381,7 @@ export class DeploymentExecutor extends EventEmitter {
     });
   }
 
-  // stop deployment
+  // stop deployment (preserves persistent volumes for restart)
   async stopDeployment(deploymentId: string): Promise<void> {
     const execution = this.executions.get(deploymentId);
     if (!execution) {
@@ -389,13 +389,28 @@ export class DeploymentExecutor extends EventEmitter {
       return;
     }
 
-    await this.cleanupDeployment(deploymentId);
+    await this.cleanupDeployment(deploymentId, false);
 
     logger.info({ deploymentId }, 'deployment stopped');
   }
 
+  // close deployment permanently (deletes all resources including persistent volumes)
+  async closeDeployment(deploymentId: string): Promise<void> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      // try to find and clean up volumes anyway
+      await this.cleanupVolumes(deploymentId);
+      logger.warn({ deploymentId }, 'deployment not in memory, cleaned up volumes');
+      return;
+    }
+
+    await this.cleanupDeployment(deploymentId, true);
+
+    logger.info({ deploymentId }, 'deployment closed permanently');
+  }
+
   // cleanup deployment resources
-  private async cleanupDeployment(deploymentId: string): Promise<void> {
+  private async cleanupDeployment(deploymentId: string, deleteVolumes: boolean): Promise<void> {
     const execution = this.executions.get(deploymentId);
     if (!execution) return;
 
@@ -422,10 +437,37 @@ export class DeploymentExecutor extends EventEmitter {
       }
     }
 
-    // note: don't remove volumes automatically (persistent data)
-    // user can manually clean up or we can add a flag
+    // remove volumes if requested (deployment closed permanently)
+    if (deleteVolumes) {
+      await this.cleanupVolumes(deploymentId);
+    } else {
+      logger.info({ deploymentId, volumeCount: execution.volumes.length }, 'preserving persistent volumes');
+    }
 
     this.executions.delete(deploymentId);
+  }
+
+  // cleanup volumes for a deployment
+  private async cleanupVolumes(deploymentId: string): Promise<void> {
+    try {
+      const volumes = await this.docker.listVolumes({
+        filters: {
+          name: [`kova-${deploymentId}`]
+        }
+      });
+
+      for (const vol of volumes.Volumes || []) {
+        try {
+          const volume = this.docker.getVolume(vol.Name);
+          await volume.remove();
+          logger.info({ volumeName: vol.Name }, 'volume removed');
+        } catch (err) {
+          logger.debug({ err, volumeName: vol.Name }, 'failed to remove volume');
+        }
+      }
+    } catch (err) {
+      logger.error({ err, deploymentId }, 'failed to cleanup volumes');
+    }
   }
 
   // get running deployments
@@ -710,5 +752,151 @@ export class DeploymentExecutor extends EventEmitter {
       }
       throw err;
     }
+  }
+
+  // shell session tracking
+  private shellSessions: Map<string, {
+    exec: any;
+    stream: any;
+    deploymentId: string;
+    serviceName: string;
+  }> = new Map();
+
+  // start interactive shell session in container
+  async startShellSession(
+    sessionId: string,
+    deploymentId: string,
+    serviceName: string,
+    onOutput: (data: string) => void
+  ): Promise<boolean> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      logger.warn({ deploymentId, sessionId }, 'shell: deployment not found');
+      return false;
+    }
+
+    // try requested service first, then fall back to first available service
+    let containerId = execution.containers.get(serviceName);
+    let actualServiceName = serviceName;
+
+    if (!containerId && execution.containers.size > 0) {
+      // fall back to first available service
+      const firstEntry = execution.containers.entries().next().value;
+      if (firstEntry) {
+        actualServiceName = firstEntry[0];
+        containerId = firstEntry[1];
+        logger.info({ deploymentId, requestedService: serviceName, actualService: actualServiceName },
+          'shell: using fallback service');
+      }
+    }
+
+    if (!containerId) {
+      logger.warn({ deploymentId, serviceName, sessionId, availableServices: Array.from(execution.containers.keys()) },
+        'shell: no services found');
+      return false;
+    }
+
+    try {
+      const container = this.docker.getContainer(containerId);
+
+      // create exec instance for interactive shell
+      const exec = await container.exec({
+        Cmd: ['/bin/sh'],
+        AttachStdin: true,
+        AttachStdout: true,
+        AttachStderr: true,
+        Tty: true
+      });
+
+      // start the exec and get stream
+      const stream = await exec.start({
+        hijack: true,
+        stdin: true,
+        Tty: true
+      });
+
+      // store session
+      this.shellSessions.set(sessionId, {
+        exec,
+        stream,
+        deploymentId,
+        serviceName
+      });
+
+      // forward output to callback
+      stream.on('data', (chunk: Buffer) => {
+        // tty mode - data comes as plain text
+        const output = chunk.toString('utf8');
+        onOutput(output);
+      });
+
+      stream.on('end', () => {
+        logger.info({ sessionId }, 'shell session stream ended');
+        this.shellSessions.delete(sessionId);
+        this.emit('shell-closed', { sessionId });
+      });
+
+      stream.on('error', (err: any) => {
+        logger.error({ err, sessionId }, 'shell session stream error');
+        this.shellSessions.delete(sessionId);
+      });
+
+      logger.info({ sessionId, deploymentId, serviceName, containerId }, 'shell session started');
+      return true;
+    } catch (err) {
+      logger.error({ err, sessionId, deploymentId }, 'failed to start shell session');
+      return false;
+    }
+  }
+
+  // send input to shell session
+  sendShellInput(sessionId: string, input: string): boolean {
+    const session = this.shellSessions.get(sessionId);
+    if (!session) {
+      logger.warn({ sessionId }, 'shell input: session not found');
+      return false;
+    }
+
+    try {
+      session.stream.write(input);
+      return true;
+    } catch (err) {
+      logger.error({ err, sessionId }, 'failed to send shell input');
+      return false;
+    }
+  }
+
+  // resize shell terminal
+  resizeShell(sessionId: string, cols: number, rows: number): boolean {
+    const session = this.shellSessions.get(sessionId);
+    if (!session) {
+      return false;
+    }
+
+    try {
+      // resize the tty
+      session.exec.resize({ h: rows, w: cols });
+      return true;
+    } catch (err) {
+      logger.debug({ err, sessionId }, 'failed to resize shell');
+      return false;
+    }
+  }
+
+  // close shell session
+  closeShellSession(sessionId: string): void {
+    const session = this.shellSessions.get(sessionId);
+    if (!session) {
+      return;
+    }
+
+    try {
+      session.stream.end();
+    } catch (err) {
+      // ignore
+    }
+
+    this.shellSessions.delete(sessionId);
+    logger.info({ sessionId }, 'shell session closed');
   }
 }

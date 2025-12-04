@@ -126,6 +126,23 @@ export class P2PNode extends EventEmitter {
         this.emit('deployment-paused', message.data);
         break;
 
+      // shell session handling - forward to deployment executor
+      case 'shell-start':
+        this.emit('shell-start', message.data);
+        break;
+
+      case 'shell-input':
+        this.emit('shell-input', message.data);
+        break;
+
+      case 'shell-resize':
+        this.emit('shell-resize', message.data);
+        break;
+
+      case 'shell-close':
+        this.emit('shell-close', message.data);
+        break;
+
       case 'node-announcement':
         break;
 

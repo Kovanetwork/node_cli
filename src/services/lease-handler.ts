@@ -78,13 +78,14 @@ export class LeaseHandler {
       logger.info({ deploymentId: data.deploymentId }, 'received closure notification via p2p');
 
       try {
-        await this.executor.stopDeployment(data.deploymentId);
+        // use closeDeployment to permanently delete all resources including volumes
+        await this.executor.closeDeployment(data.deploymentId);
         this.activeLeases.delete(data.deploymentId);
         this.filesVersions.delete(data.deploymentId);
         stateManager.removeDeployment(data.deploymentId);
-        logger.info({ deploymentId: data.deploymentId }, 'deployment stopped via p2p notification');
+        logger.info({ deploymentId: data.deploymentId }, 'deployment closed permanently via p2p notification');
       } catch (err) {
-        logger.error({ err, deploymentId: data.deploymentId }, 'failed to stop deployment from p2p');
+        logger.error({ err, deploymentId: data.deploymentId }, 'failed to close deployment from p2p');
       }
     });
 
@@ -179,14 +180,19 @@ export class LeaseHandler {
             }, 'files updated - syncing changes');
 
             try {
-              // update files for this deployment
-              // assume 'web' service for now (could parse manifest for service names)
-              await this.executor.updateDeploymentFiles(lease.deploymentId, 'web');
+              // get service names from manifest
+              const services = lease.manifest?.services || {};
+              const serviceNames = Object.keys(services);
+
+              // update files for each service (or use first service if only one)
+              const serviceName = serviceNames[0] || 'web';
+
+              await this.executor.updateDeploymentFiles(lease.deploymentId, serviceName);
 
               // update tracked version
               this.filesVersions.set(lease.deploymentId, currentVersion);
 
-              logger.info({ deploymentId: lease.deploymentId }, 'files synced successfully');
+              logger.info({ deploymentId: lease.deploymentId, serviceName }, 'files synced successfully');
             } catch (err) {
               logger.error({ err, deploymentId: lease.deploymentId }, 'failed to sync files');
             }

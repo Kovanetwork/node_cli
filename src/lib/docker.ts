@@ -2,14 +2,22 @@ import Docker from 'dockerode';
 import { logger } from './logger.js';
 import { Readable } from 'stream';
 
+interface VolumeSpec {
+  name: string;
+  mountPath: string;
+  persistent?: boolean;
+  sizeGb?: number;
+}
+
 export class DockerManager {
   private docker: Docker;
-  
+  private persistentVolumes: Map<string, string[]> = new Map(); // deploymentId -> volumeNames
+
   constructor() {
     // use socket if on linux, named pipe on windows
     this.docker = new Docker({
-      socketPath: process.platform === 'win32' 
-        ? '//./pipe/docker_engine' 
+      socketPath: process.platform === 'win32'
+        ? '//./pipe/docker_engine'
         : '/var/run/docker.sock'
     });
   }
@@ -101,6 +109,62 @@ export class DockerManager {
       }
     }
 
+    // handle volumes - persistent vs ephemeral
+    const binds: string[] = [];
+    const volumeNames: string[] = [];
+
+    if (spec.volumes && Array.isArray(spec.volumes)) {
+      for (const vol of spec.volumes as VolumeSpec[]) {
+        if (vol.persistent) {
+          // create or reuse persistent docker volume
+          const volumeName = `kova-pv-${spec.jobId}-${vol.name}`;
+          try {
+            // check if volume exists
+            await this.docker.getVolume(volumeName).inspect();
+            logger.debug({ volumeName }, 'reusing existing persistent volume');
+          } catch (err) {
+            // create new volume
+            await this.docker.createVolume({
+              Name: volumeName,
+              Labels: {
+                'kova.job.id': spec.jobId,
+                'kova.volume.name': vol.name,
+                'kova.persistent': 'true'
+              }
+            });
+            logger.info({ volumeName, mountPath: vol.mountPath }, 'created persistent volume');
+          }
+          binds.push(`${volumeName}:${vol.mountPath}:rw`);
+          volumeNames.push(volumeName);
+        } else {
+          // ephemeral volume - use tmpfs or empty volume
+          const volumeName = `kova-vol-${spec.jobId}-${vol.name}`;
+          await this.docker.createVolume({
+            Name: volumeName,
+            Labels: {
+              'kova.job.id': spec.jobId,
+              'kova.volume.name': vol.name,
+              'kova.persistent': 'false'
+            }
+          });
+          binds.push(`${volumeName}:${vol.mountPath}:rw`);
+          volumeNames.push(volumeName);
+        }
+      }
+    }
+
+    // track persistent volumes for this deployment
+    if (volumeNames.length > 0) {
+      this.persistentVolumes.set(spec.jobId, volumeNames);
+    }
+
+    // determine tmpfs mounts - only use for /app if no custom volumes mounted there
+    const tmpfsMounts: Record<string, string> = {};
+    const hasAppMount = spec.volumes?.some((v: VolumeSpec) => v.mountPath === '/app');
+    if (!hasAppMount) {
+      tmpfsMounts['/app'] = 'rw,size=100m,mode=1777';
+    }
+
     const container = await this.docker.createContainer({
       Image: spec.image || 'alpine:latest',
       name: `kova-${spec.jobId}`,
@@ -112,10 +176,10 @@ export class DockerManager {
         Memory: spec.memory * 1024 * 1024, // mb to bytes
         NanoCpus: spec.cpus * 1000000000,  // cpu cores to nanocpus
         ReadonlyRootfs: false, // allow writing for interactive use
-        // mount tmpfs for /app to allow file creation
-        Tmpfs: {
-          '/app': 'rw,size=100m,mode=1777'
-        },
+        // mount tmpfs for /app only if no custom volumes there
+        Tmpfs: Object.keys(tmpfsMounts).length > 0 ? tmpfsMounts : undefined,
+        // mount persistent and ephemeral volumes
+        Binds: binds.length > 0 ? binds : undefined,
         CapDrop: ['ALL'],
         CapAdd: [], // NO capabilities
         SecurityOpt: ['no-new-privileges'],
@@ -135,10 +199,11 @@ export class DockerManager {
       Labels: {
         'kova.job.id': spec.jobId,
         'kova.job.user': spec.userId || 'unknown',
-        'kova.version': '0.0.1'
+        'kova.version': '0.0.1',
+        'kova.has.persistent.volumes': volumeNames.some(v => v.includes('-pv-')) ? 'true' : 'false'
       }
     });
-    
+
     await container.start();
     return container;
   }
@@ -180,13 +245,14 @@ export class DockerManager {
     };
   }
   
-  async cleanupContainer(containerId: string) {
+  async cleanupContainer(containerId: string, deleteVolumes: boolean = false) {
     try {
       const container = this.docker.getContainer(containerId);
 
       // get container info to find its network
       const info = await container.inspect();
       const jobId = info.Config.Labels?.['kova.job.id'];
+      const hasPersistentVolumes = info.Config.Labels?.['kova.has.persistent.volumes'] === 'true';
 
       // check if its still running
       if (info.State.Running) {
@@ -209,6 +275,26 @@ export class DockerManager {
             logger.debug({ err, networkName }, 'network cleanup failed');
           }
         }
+
+        // cleanup volumes - only delete persistent volumes if explicitly requested
+        const volumeNames = this.persistentVolumes.get(jobId) || [];
+        for (const volumeName of volumeNames) {
+          const isPersistent = volumeName.includes('-pv-');
+          if (!isPersistent || deleteVolumes) {
+            try {
+              const volume = this.docker.getVolume(volumeName);
+              await volume.remove();
+              logger.debug({ volumeName, isPersistent }, 'volume cleaned up');
+            } catch (err: any) {
+              if (err.statusCode !== 404) {
+                logger.debug({ err, volumeName }, 'volume cleanup failed');
+              }
+            }
+          } else {
+            logger.debug({ volumeName }, 'keeping persistent volume for reuse');
+          }
+        }
+        this.persistentVolumes.delete(jobId);
       }
     } catch (err: any) {
       // probably already gone
@@ -216,6 +302,44 @@ export class DockerManager {
         logger.debug({ err, containerId }, 'cleanup failed');
       }
     }
+  }
+
+  // delete all volumes for a deployment (called when deployment is closed)
+  async deleteDeploymentVolumes(jobId: string) {
+    const volumes = await this.docker.listVolumes({
+      filters: {
+        label: [`kova.job.id=${jobId}`]
+      }
+    });
+
+    for (const vol of volumes.Volumes || []) {
+      try {
+        const volume = this.docker.getVolume(vol.Name);
+        await volume.remove();
+        logger.info({ volumeName: vol.Name }, 'deleted deployment volume');
+      } catch (err: any) {
+        if (err.statusCode !== 404) {
+          logger.warn({ err, volumeName: vol.Name }, 'failed to delete volume');
+        }
+      }
+    }
+
+    this.persistentVolumes.delete(jobId);
+  }
+
+  // list persistent volumes for a deployment
+  async listDeploymentVolumes(jobId: string): Promise<Array<{ name: string; size: number; persistent: boolean }>> {
+    const volumes = await this.docker.listVolumes({
+      filters: {
+        label: [`kova.job.id=${jobId}`]
+      }
+    });
+
+    return (volumes.Volumes || []).map(vol => ({
+      name: vol.Labels?.['kova.volume.name'] || vol.Name,
+      size: 0, // docker doesn't track volume size easily
+      persistent: vol.Labels?.['kova.persistent'] === 'true'
+    }));
   }
   
   async listKovaContainers() {

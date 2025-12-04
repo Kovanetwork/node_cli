@@ -1,5 +1,6 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
+import websocket from '@fastify/websocket';
 import { ContainerManager } from '../services/container-manager.js';
 import { DeploymentExecutor } from '../services/deployment-executor.js';
 import { logger } from '../lib/logger.js';
@@ -24,6 +25,9 @@ export class NodeAPIServer {
     await this.app.register(cors, {
       origin: true // allow all for now
     });
+
+    // register websocket support for shell access
+    await this.app.register(websocket);
 
     // exec command in container
     this.app.post('/jobs/:jobId/exec', async (request: any, reply: any) => {
@@ -213,6 +217,63 @@ export class NodeAPIServer {
         status: 'ok',
         runningJobs: this.containerManager.getRunningJobs().length
       };
+    });
+
+    // websocket shell endpoint for direct access (http fallback when p2p unavailable)
+    this.app.get('/deployments/:deploymentId/shell', { websocket: true }, async (connection: any, req: any) => {
+      const deploymentId = req.params.deploymentId;
+      const serviceName = req.query.service || 'web';
+
+      logger.info({ deploymentId, serviceName }, 'direct shell websocket connection');
+
+      if (!this.deploymentExecutor) {
+        connection.socket.close(1008, 'deployment executor not available');
+        return;
+      }
+
+      let sessionId: string | null = null;
+
+      connection.socket.on('message', async (data: Buffer) => {
+        try {
+          const message = JSON.parse(data.toString());
+
+          if (message.type === 'init') {
+            // generate session id and start shell
+            sessionId = `shell-${deploymentId}-${Date.now()}`;
+
+            const success = await this.deploymentExecutor!.startShellSession(
+              sessionId,
+              deploymentId,
+              serviceName,
+              (output: string) => {
+                // send output back to client
+                connection.socket.send(JSON.stringify({ type: 'output', data: output }));
+              }
+            );
+
+            if (success) {
+              connection.socket.send(JSON.stringify({ type: 'ready', sessionId }));
+            } else {
+              connection.socket.send(JSON.stringify({ type: 'error', message: 'failed to start shell session' }));
+              connection.socket.close(1008, 'shell start failed');
+            }
+          } else if (message.type === 'input' && sessionId) {
+            this.deploymentExecutor!.sendShellInput(sessionId, message.data);
+          } else if (message.type === 'resize' && sessionId) {
+            this.deploymentExecutor!.resizeShell(sessionId, message.cols, message.rows);
+          }
+        } catch (err) {
+          logger.error({ err, deploymentId }, 'shell message error');
+          connection.socket.send(JSON.stringify({ type: 'error', message: 'command failed' }));
+        }
+      });
+
+      connection.socket.on('close', () => {
+        if (sessionId && this.deploymentExecutor) {
+          this.deploymentExecutor.closeShellSession(sessionId);
+        }
+        logger.info({ deploymentId }, 'direct shell websocket closed');
+      });
     });
 
     await this.app.listen({ port: this.port, host: '0.0.0.0' });

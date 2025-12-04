@@ -314,6 +314,54 @@ export async function startNode(options: any) {
 
       leaseHandler.start(10000); // check for leases every 10s
       logger.info({ nodeId }, 'lease handler started - will execute assigned deployments');
+
+      // wire up shell session handling from p2p to deployment executor
+      p2p.on('shell-start', async (data) => {
+        const { sessionId, deploymentId, serviceName } = data;
+        logger.info({ sessionId, deploymentId, serviceName }, 'shell-start request received');
+
+        const success = await deploymentExecutor!.startShellSession(
+          sessionId,
+          deploymentId,
+          serviceName,
+          (output) => {
+            // send output back to orchestrator via p2p
+            p2p.sendToOrchestrator({
+              type: 'shell-output',
+              data: { sessionId, output }
+            });
+          }
+        );
+
+        if (!success) {
+          logger.warn({ sessionId, deploymentId }, 'failed to start shell session');
+        }
+      });
+
+      p2p.on('shell-input', (data) => {
+        const { sessionId, input } = data;
+        deploymentExecutor!.sendShellInput(sessionId, input);
+      });
+
+      p2p.on('shell-resize', (data) => {
+        const { sessionId, cols, rows } = data;
+        deploymentExecutor!.resizeShell(sessionId, cols, rows);
+      });
+
+      p2p.on('shell-close', (data) => {
+        const { sessionId } = data;
+        deploymentExecutor!.closeShellSession(sessionId);
+      });
+
+      // forward shell-closed events from executor back to orchestrator
+      deploymentExecutor!.on('shell-closed', ({ sessionId }) => {
+        p2p.sendToOrchestrator({
+          type: 'shell-closed',
+          data: { sessionId }
+        });
+      });
+
+      logger.info('shell session handlers configured');
     }
 
     // keep running until ctrl+c
