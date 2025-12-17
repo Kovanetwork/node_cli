@@ -567,46 +567,75 @@ export class DeploymentExecutor extends EventEmitter {
 
     logger.info({ deploymentId, serviceName, volumeName }, 'downloading files from orchestrator');
 
-    // get orchestrator URL from config - require it in production
-    const orchestratorUrl = process.env.ORCHESTRATOR_URL;
-    if (!orchestratorUrl) {
-      throw new Error('ORCHESTRATOR_URL environment variable is required');
-    }
+    // get orchestrator URL from config
+    const orchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:3000';
     const downloadUrl = `${orchestratorUrl}/api/v1/deployments/${deploymentId}/services/${serviceName}/files/download`;
 
     // get provider token from config
     const providerToken = process.env.PROVIDER_TOKEN || '';
+
+    // max download size (100mb to prevent disk exhaustion)
+    const maxDownloadSize = 100 * 1024 * 1024;
 
     try {
       // download tarball to temp file
       const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kova-download-'));
       const tarballPath = path.join(tempDir, 'files.tar.gz');
 
-      await new Promise<void>((resolve, reject) => {
+      const downloadResult = await new Promise<{ checksum?: string }>((resolve, reject) => {
         const proto = orchestratorUrl.startsWith('https') ? https : http;
+        const crypto = require('crypto');
+        const hash = crypto.createHash('sha256');
+        let downloadedSize = 0;
 
         const req = proto.get(downloadUrl, {
           headers: {
             'Authorization': `Bearer ${providerToken}`
           }
-        }, (res) => {
+        }, (res: any) => {
           if (res.statusCode === 404) {
-            // no files uploaded, skip
             logger.info({ deploymentId, serviceName }, 'no uploaded files found, skipping');
-            resolve();
+            resolve({});
             return;
           }
 
           if (res.statusCode !== 200) {
-            reject(new Error(`Failed to download files: ${res.statusCode} ${res.statusMessage}`));
+            reject(new Error(`failed to download files: ${res.statusCode} ${res.statusMessage}`));
             return;
           }
 
+          // get expected checksum from header if provided
+          const expectedChecksum = res.headers['x-checksum'];
+
           const fileStream = fs.createWriteStream(tarballPath);
+
+          res.on('data', (chunk: Buffer) => {
+            downloadedSize += chunk.length;
+            // check size limit
+            if (downloadedSize > maxDownloadSize) {
+              req.destroy();
+              fileStream.destroy();
+              fs.rmSync(tempDir, { recursive: true, force: true });
+              reject(new Error(`download exceeds size limit of ${maxDownloadSize} bytes`));
+              return;
+            }
+            hash.update(chunk);
+          });
+
           res.pipe(fileStream);
           fileStream.on('finish', () => {
             fileStream.close();
-            resolve();
+            const actualChecksum = hash.digest('hex');
+
+            // verify checksum if provided
+            if (expectedChecksum && actualChecksum !== expectedChecksum) {
+              fs.rmSync(tempDir, { recursive: true, force: true });
+              reject(new Error(`checksum mismatch: expected ${expectedChecksum}, got ${actualChecksum}`));
+              return;
+            }
+
+            logger.info({ deploymentId, size: downloadedSize, checksum: actualChecksum }, 'file download verified');
+            resolve({ checksum: actualChecksum });
           });
           fileStream.on('error', reject);
         });
