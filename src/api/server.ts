@@ -12,11 +12,37 @@ export class NodeAPIServer {
   private containerManager: ContainerManager;
   private deploymentExecutor?: DeploymentExecutor;
   private port: number;
+  private authToken: string;
 
   constructor(containerManager: ContainerManager, deploymentExecutor?: DeploymentExecutor, port: number = 4002) {
     this.containerManager = containerManager;
     this.deploymentExecutor = deploymentExecutor;
     this.port = port;
+    // token for authenticating requests from orchestrator
+    this.authToken = process.env.PROVIDER_TOKEN || '';
+  }
+
+  // verify request has valid auth token
+  private verifyAuth(request: any, reply: any): boolean {
+    // health check doesn't need auth
+    if (request.url === '/health') {
+      return true;
+    }
+
+    const authHeader = request.headers.authorization;
+    if (!authHeader) {
+      reply.code(401).send({ error: 'authorization required' });
+      return false;
+    }
+
+    const token = authHeader.replace('Bearer ', '');
+    if (!this.authToken || token !== this.authToken) {
+      logger.warn({ url: request.url }, 'invalid auth token');
+      reply.code(401).send({ error: 'invalid token' });
+      return false;
+    }
+
+    return true;
   }
 
   async start() {
@@ -27,18 +53,15 @@ export class NodeAPIServer {
     const isDev = process.env.NODE_ENV !== 'production';
 
     await this.app.register(cors, {
-      origin: (origin, callback) => {
-        // allow requests with no origin (local tools, curl)
+      origin: (origin: string, callback: any) => {
         if (!origin) {
           callback(null, true);
           return;
         }
-        // in dev, allow localhost
         if (isDev && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
           callback(null, true);
           return;
         }
-        // check whitelist
         if (allowedOrigins.includes(origin)) {
           callback(null, true);
         } else {
@@ -52,6 +75,8 @@ export class NodeAPIServer {
 
     // exec command in container
     this.app.post('/jobs/:jobId/exec', async (request: any, reply: any) => {
+      if (!this.verifyAuth(request, reply)) return;
+
       const { jobId } = request.params;
       const { command } = request.body;
 
@@ -76,6 +101,8 @@ export class NodeAPIServer {
 
     // get container logs
     this.app.get('/jobs/:jobId/logs', async (request: any, reply: any) => {
+      if (!this.verifyAuth(request, reply)) return;
+
       const { jobId } = request.params;
       const tail = parseInt(request.query.tail || '100');
 
@@ -96,6 +123,8 @@ export class NodeAPIServer {
 
     // write file to container
     this.app.post('/jobs/:jobId/files', async (request: any, reply: any) => {
+      if (!this.verifyAuth(request, reply)) return;
+
       const { jobId } = request.params;
       const { filepath, content } = request.body;
 
@@ -117,6 +146,8 @@ export class NodeAPIServer {
 
     // read file from container
     this.app.get('/jobs/:jobId/files/*', async (request: any, reply: any) => {
+      if (!this.verifyAuth(request, reply)) return;
+
       const { jobId } = request.params;
       const filepath = (request.params as any)['*'];
 
@@ -138,6 +169,8 @@ export class NodeAPIServer {
 
     // proxy http requests to deployment containers
     this.app.all('/deployments/:deploymentId/proxy', async (request: any, reply: any) => {
+      if (!this.verifyAuth(request, reply)) return;
+
       const { deploymentId } = request.params;
       const targetPort = parseInt(request.headers['x-target-port'] || '80');
 
@@ -211,6 +244,8 @@ export class NodeAPIServer {
 
     // update deployment files
     this.app.post('/deployments/:deploymentId/services/:serviceName/update-files', async (request: any, reply: any) => {
+      if (!this.verifyAuth(request, reply)) return;
+
       const { deploymentId, serviceName } = request.params;
 
       if (!this.deploymentExecutor) {
@@ -242,6 +277,14 @@ export class NodeAPIServer {
 
     // websocket shell endpoint for direct access (http fallback when p2p unavailable)
     this.app.get('/deployments/:deploymentId/shell', { websocket: true }, async (connection: any, req: any) => {
+      // verify auth token from query param or header
+      const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
+      if (!this.authToken || token !== this.authToken) {
+        logger.warn({ deploymentId: req.params.deploymentId }, 'shell access denied - invalid token');
+        connection.socket.close(1008, 'unauthorized');
+        return;
+      }
+
       const deploymentId = req.params.deploymentId;
       const serviceName = req.query.service || 'web';
 

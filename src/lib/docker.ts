@@ -165,6 +165,41 @@ export class DockerManager {
       tmpfsMounts['/app'] = 'rw,size=100m,mode=1777';
     }
 
+    // build host config with optional gpu support
+    const hostConfig: any = {
+      Memory: spec.memory * 1024 * 1024, // mb to bytes
+      NanoCpus: spec.cpus * 1000000000,  // cpu cores to nanocpus
+      ReadonlyRootfs: false, // allow writing for interactive use
+      // mount tmpfs for /app only if no custom volumes there
+      Tmpfs: Object.keys(tmpfsMounts).length > 0 ? tmpfsMounts : undefined,
+      // mount persistent and ephemeral volumes
+      Binds: binds.length > 0 ? binds : undefined,
+      CapDrop: ['ALL'],
+      CapAdd: [], // NO capabilities
+      SecurityOpt: ['no-new-privileges'],
+      // disk quota if supported
+      StorageOpt: spec.disk ? { size: `${spec.disk}G` } : undefined,
+      // NETWORK ISOLATION: Each container gets its own network
+      NetworkMode: network ? networkName : 'none',
+      // auto remove after exit
+      AutoRemove: false,
+      // Prevent container from accessing host services
+      ExtraHosts: [],
+      Dns: ['8.8.8.8', '1.1.1.1']
+    };
+
+    // add gpu support if requested
+    if (spec.gpu && spec.gpu > 0) {
+      hostConfig.DeviceRequests = [{
+        Driver: '',
+        Count: spec.gpu,
+        DeviceIDs: [],
+        Capabilities: [['gpu']],
+        Options: {}
+      }];
+      logger.info({ jobId: spec.jobId, gpuCount: spec.gpu }, 'enabling gpu access for container');
+    }
+
     const container = await this.docker.createContainer({
       Image: spec.image || 'alpine:latest',
       name: `kova-${spec.jobId}`,
@@ -172,27 +207,7 @@ export class DockerManager {
       Cmd: containerCmd || ['/bin/sh', '-c', 'echo "no command provided" && sleep 60'],
       Tty: false,
       OpenStdin: false,
-      HostConfig: {
-        Memory: spec.memory * 1024 * 1024, // mb to bytes
-        NanoCpus: spec.cpus * 1000000000,  // cpu cores to nanocpus
-        ReadonlyRootfs: false, // allow writing for interactive use
-        // mount tmpfs for /app only if no custom volumes there
-        Tmpfs: Object.keys(tmpfsMounts).length > 0 ? tmpfsMounts : undefined,
-        // mount persistent and ephemeral volumes
-        Binds: binds.length > 0 ? binds : undefined,
-        CapDrop: ['ALL'],
-        CapAdd: [], // NO capabilities
-        SecurityOpt: ['no-new-privileges'],
-        // disk quota if supported
-        StorageOpt: spec.disk ? { size: `${spec.disk}G` } : undefined,
-        // NETWORK ISOLATION: Each container gets its own network
-        NetworkMode: network ? networkName : 'none',
-        // auto remove after exit
-        AutoRemove: false,
-        // Prevent container from accessing host services
-        ExtraHosts: [],
-        Dns: ['8.8.8.8', '1.1.1.1']
-      },
+      HostConfig: hostConfig,
       Env: envVars,
       WorkingDir: '/app',
       // labels for tracking
@@ -200,7 +215,8 @@ export class DockerManager {
         'kova.job.id': spec.jobId,
         'kova.job.user': spec.userId || 'unknown',
         'kova.version': '0.0.1',
-        'kova.has.persistent.volumes': volumeNames.some(v => v.includes('-pv-')) ? 'true' : 'false'
+        'kova.has.persistent.volumes': volumeNames.some(v => v.includes('-pv-')) ? 'true' : 'false',
+        'kova.gpu.count': spec.gpu ? String(spec.gpu) : '0'
       }
     });
 
