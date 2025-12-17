@@ -567,8 +567,11 @@ export class DeploymentExecutor extends EventEmitter {
 
     logger.info({ deploymentId, serviceName, volumeName }, 'downloading files from orchestrator');
 
-    // get orchestrator URL from config
-    const orchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:3000';
+    // get orchestrator URL from config - require it in production
+    const orchestratorUrl = process.env.ORCHESTRATOR_URL;
+    if (!orchestratorUrl) {
+      throw new Error('ORCHESTRATOR_URL environment variable is required');
+    }
     const downloadUrl = `${orchestratorUrl}/api/v1/deployments/${deploymentId}/services/${serviceName}/files/download`;
 
     // get provider token from config

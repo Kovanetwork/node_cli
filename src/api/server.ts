@@ -22,8 +22,29 @@ export class NodeAPIServer {
   async start() {
     this.app = Fastify({ logger: logger as any });
 
+    // cors config - restrict in production
+    const allowedOrigins = process.env.ALLOWED_ORIGINS?.split(',') || [];
+    const isDev = process.env.NODE_ENV !== 'production';
+
     await this.app.register(cors, {
-      origin: true // allow all for now
+      origin: (origin, callback) => {
+        // allow requests with no origin (local tools, curl)
+        if (!origin) {
+          callback(null, true);
+          return;
+        }
+        // in dev, allow localhost
+        if (isDev && (origin.includes('localhost') || origin.includes('127.0.0.1'))) {
+          callback(null, true);
+          return;
+        }
+        // check whitelist
+        if (allowedOrigins.includes(origin)) {
+          callback(null, true);
+        } else {
+          callback(new Error('cors not allowed'), false);
+        }
+      }
     });
 
     // register websocket support for shell access
