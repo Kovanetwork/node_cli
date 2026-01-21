@@ -5,6 +5,7 @@ import { logger } from '../lib/logger.js';
 import { DeploymentExecutor } from './deployment-executor.js';
 import { P2PNode } from '../lib/p2p.js';
 import { stateManager } from '../lib/state.js';
+import Docker from 'dockerode';
 
 interface LeaseHandlerConfig {
   nodeId: string;
@@ -27,14 +28,18 @@ export class LeaseHandler {
   private config: LeaseHandlerConfig;
   private executor: DeploymentExecutor;
   private p2pNode?: P2PNode;
+  private docker: Docker;
   private pollingInterval: NodeJS.Timeout | null = null;
+  private healthCheckInterval: NodeJS.Timeout | null = null;
   private activeLeases: Set<string> = new Set();
   private filesVersions: Map<string, number> = new Map();
+  private restartAttempts: Map<string, number> = new Map();
 
   constructor(config: LeaseHandlerConfig, executor: DeploymentExecutor, p2pNode?: P2PNode) {
     this.config = config;
     this.executor = executor;
     this.p2pNode = p2pNode;
+    this.docker = new Docker();
 
     this.executor.on('log', async (logData) => {
       await this.sendLogToOrchestrator(logData);
@@ -120,16 +125,103 @@ export class LeaseHandler {
       }
     }, intervalMs);
 
+    // start container health check (every 30 seconds)
+    this.healthCheckInterval = setInterval(async () => {
+      try {
+        await this.checkAndRestartContainers();
+      } catch (err) {
+        logger.error({ err }, 'container health check failed');
+      }
+    }, 30000);
+
     // run immediately
     this.pollLeases();
+  }
+
+  // check container health and restart stopped containers
+  private async checkAndRestartContainers(): Promise<void> {
+    for (const deploymentId of this.activeLeases) {
+      try {
+        // find containers for this deployment
+        const containers = await this.docker.listContainers({
+          all: true,
+          filters: { label: [`kova.deployment=${deploymentId}`] }
+        });
+
+        for (const containerInfo of containers) {
+          const containerName = containerInfo.Names[0]?.replace('/', '') || '';
+          const isRunning = containerInfo.State === 'running';
+
+          if (!isRunning) {
+            const attempts = this.restartAttempts.get(deploymentId) || 0;
+
+            // limit restart attempts to prevent infinite loops
+            if (attempts >= 5) {
+              logger.error({
+                deploymentId,
+                containerName,
+                attempts
+              }, 'max restart attempts reached - container needs manual intervention');
+              continue;
+            }
+
+            logger.warn({
+              deploymentId,
+              containerName,
+              state: containerInfo.State,
+              status: containerInfo.Status
+            }, 'container stopped - attempting restart');
+
+            try {
+              const container = this.docker.getContainer(containerInfo.Id);
+              await container.start();
+
+              // reset attempts on successful restart
+              this.restartAttempts.set(deploymentId, 0);
+
+              logger.info({
+                deploymentId,
+                containerName
+              }, 'container restarted successfully');
+            } catch (err: any) {
+              this.restartAttempts.set(deploymentId, attempts + 1);
+
+              // if network error, try to recreate the container
+              if (err.message?.includes('network') || err.message?.includes('not found')) {
+                logger.warn({
+                  deploymentId,
+                  containerName,
+                  error: err.message
+                }, 'network error on restart - container may need recreation');
+              } else {
+                logger.error({
+                  err,
+                  deploymentId,
+                  containerName
+                }, 'failed to restart container');
+              }
+            }
+          } else {
+            // container is running, reset restart attempts
+            this.restartAttempts.delete(deploymentId);
+          }
+        }
+      } catch (err) {
+        logger.debug({ err, deploymentId }, 'health check error for deployment');
+      }
+    }
   }
 
   stop(): void {
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
       this.pollingInterval = null;
-      logger.info('lease handler stopped');
     }
+    if (this.healthCheckInterval) {
+      clearInterval(this.healthCheckInterval);
+      this.healthCheckInterval = null;
+    }
+    logger.info('lease handler stopped');
   }
 
   // poll for active leases assigned to this node
