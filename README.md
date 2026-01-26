@@ -33,7 +33,7 @@ yarn global add @kovanetwork/node-cli
 
 ### 1. Obtain API Key
 
-Visit https://test.kovanetwork.com and authenticate with your wallet. Navigate to the Provider section to retrieve your API key.
+Visit https://app.kovanetwork.com and authenticate with your wallet. Navigate to the Provider section to retrieve your API key.
 
 ### 2. Start Your Node
 
@@ -91,7 +91,7 @@ Providers are compensated based on actual resource consumption. Payment rates ar
 - Job execution duration
 - Network demand and pricing
 
-Earnings are credited to your connected wallet address. View accumulated earnings through the dashboard at https://test.kovanetwork.com or via the CLI.
+Earnings are credited to your connected wallet address. View accumulated earnings through the dashboard at https://app.kovanetwork.com or via the CLI.
 
 ## Security
 
