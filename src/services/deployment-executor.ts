@@ -5,7 +5,7 @@ import { EventEmitter } from 'events';
 import { PassThrough, Readable, Writable } from 'stream';
 import { logger } from '../lib/logger.js';
 import Docker from 'dockerode';
-import { randomBytes } from 'crypto';
+import { randomBytes, createHash } from 'crypto';
 
 interface Service {
   image: string;
@@ -55,10 +55,14 @@ interface DeploymentExecution {
 export class DeploymentExecutor extends EventEmitter {
   private docker: Docker;
   private executions: Map<string, DeploymentExecution> = new Map();
+  private orchestratorUrl: string;
+  private apiKey: string;
 
-  constructor() {
+  constructor(config?: { orchestratorUrl?: string; apiKey?: string }) {
     super();
     this.docker = new Docker();
+    this.orchestratorUrl = config?.orchestratorUrl || process.env.KOVA_ORCHESTRATOR_URL || 'http://localhost:3000';
+    this.apiKey = config?.apiKey || '';
   }
 
   // execute deployment from manifest
@@ -164,6 +168,21 @@ export class DeploymentExecutor extends EventEmitter {
     }
   }
 
+  // parse memory string like "512Mi", "2Gi" into bytes
+  private parseMemoryToBytes(size: string): number {
+    const units: Record<string, number> = {
+      'K': 1000, 'M': 1000 ** 2, 'G': 1000 ** 3, 'T': 1000 ** 4,
+      'Ki': 1024, 'Mi': 1024 ** 2, 'Gi': 1024 ** 3, 'Ti': 1024 ** 4,
+    };
+
+    const match = size.match(/^(\d+(?:\.\d+)?)\s*([A-Za-z]+)$/);
+    if (!match) return 4 * 1024 * 1024 * 1024; // 4gb fallback
+
+    const value = parseFloat(match[1]);
+    const unit = match[2];
+    return Math.floor(value * (units[unit] || 1));
+  }
+
   // start a single service
   private async startService(
     deploymentId: string,
@@ -240,7 +259,46 @@ export class DeploymentExecutor extends EventEmitter {
     }
 
     if (!isExisting) {
-      // build container config with command/args support
+      // figure out resource limits from the service's compute profile
+      let memoryLimit = 4 * 1024 * 1024 * 1024; // 4gb default
+      let cpuCores = 4; // 4 cores default
+
+      // look up the compute profile mapped to this specific service
+      const serviceDeployment = execution.manifest.deployment?.[serviceName];
+      let profileName: string | null = null;
+      if (serviceDeployment) {
+        // deployment section: { serviceName: { placementName: { profile: "profileName", count: N } } }
+        for (const [, config] of Object.entries<any>(serviceDeployment)) {
+          if (config?.profile) {
+            profileName = config.profile;
+            break;
+          }
+        }
+      }
+
+      const profiles = execution.manifest.profiles?.compute;
+      if (profiles) {
+        // use the mapped profile for this service, or fall back to first available
+        const profile = profileName && profiles[profileName]
+          ? profiles[profileName]
+          : Object.values<any>(profiles)[0];
+
+        if (profile?.resources) {
+          const res = profile.resources;
+          if (res.memory?.size) {
+            memoryLimit = this.parseMemoryToBytes(res.memory.size);
+          }
+          if (res.cpu?.units) {
+            cpuCores = parseFloat(res.cpu.units) || 4;
+          }
+        }
+      }
+
+      // clamp to sane limits
+      const maxMemory = 32 * 1024 * 1024 * 1024; // 32gb hard ceiling
+      memoryLimit = Math.min(memoryLimit, maxMemory);
+      cpuCores = Math.min(cpuCores, 32);
+
       const containerConfig: any = {
         name: containerName,
         Image: service.image,
@@ -249,10 +307,19 @@ export class DeploymentExecutor extends EventEmitter {
         HostConfig: {
           NetworkMode: networkName,
           Binds: binds,
-          // no port bindings - containers only accessible via docker network
-          ReadonlyRootfs: false, // allow writes to mounted volumes
+          ReadonlyRootfs: false,
           AutoRemove: false,
-          RestartPolicy: { Name: 'no' }
+          RestartPolicy: { Name: 'no' },
+          // resource limits based on what was ordered
+          Memory: memoryLimit,
+          MemorySwap: memoryLimit,
+          CpuPeriod: 100000,
+          CpuQuota: Math.floor(cpuCores * 100000),
+          Privileged: false,
+          PidsLimit: 256,
+          SecurityOpt: ['no-new-privileges:true'],
+          CapDrop: ['ALL'],
+          CapAdd: ['CHOWN', 'NET_BIND_SERVICE']
         },
         Labels: {
           'kova.deployment': deploymentId,
@@ -567,12 +634,11 @@ export class DeploymentExecutor extends EventEmitter {
 
     logger.info({ deploymentId, serviceName, volumeName }, 'downloading files from orchestrator');
 
-    // get orchestrator URL from config
-    const orchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:3000';
+    const orchestratorUrl = this.orchestratorUrl;
     const downloadUrl = `${orchestratorUrl}/api/v1/deployments/${deploymentId}/services/${serviceName}/files/download`;
 
-    // get provider token from config
-    const providerToken = process.env.PROVIDER_TOKEN || '';
+    // use api key for auth
+    const authToken = this.apiKey || process.env.PROVIDER_TOKEN || '';
 
     // max download size (100mb to prevent disk exhaustion)
     const maxDownloadSize = 100 * 1024 * 1024;
@@ -584,13 +650,12 @@ export class DeploymentExecutor extends EventEmitter {
 
       const downloadResult = await new Promise<{ checksum?: string }>((resolve, reject) => {
         const proto = orchestratorUrl.startsWith('https') ? https : http;
-        const crypto = require('crypto');
-        const hash = crypto.createHash('sha256');
+        const hash = createHash('sha256');
         let downloadedSize = 0;
 
         const req = proto.get(downloadUrl, {
           headers: {
-            'Authorization': `Bearer ${providerToken}`
+            'Authorization': `Bearer ${authToken}`
           }
         }, (res: any) => {
           if (res.statusCode === 404) {
@@ -657,7 +722,16 @@ export class DeploymentExecutor extends EventEmitter {
 
       await tar.extract({
         file: tarballPath,
-        cwd: extractDir
+        cwd: extractDir,
+        // prevent zip-slip: strip leading slashes and block path traversal
+        strip: 0,
+        filter: (path: string) => {
+          if (path.includes('..')) {
+            logger.warn({ path }, 'blocked path traversal attempt in tar');
+            return false;
+          }
+          return true;
+        }
       });
 
       // copy files to volume using a temporary container
@@ -740,8 +814,28 @@ export class DeploymentExecutor extends EventEmitter {
       }
     }
 
+    // backup volume to temp before clearing, so we can restore on failure
+    const backupVolumeName = `${volumeName}-backup-${Date.now()}`;
     try {
-      // clear volume contents using temporary container
+      await this.docker.createVolume({ Name: backupVolumeName });
+      await this.docker.run(
+        'alpine:latest',
+        ['sh', '-c', 'cp -a /source/. /backup/'],
+        process.stdout,
+        {
+          HostConfig: {
+            Binds: [`${volumeName}:/source:ro`, `${backupVolumeName}:/backup`],
+            AutoRemove: true
+          }
+        }
+      );
+      logger.info({ deploymentId, serviceName, backupVolumeName }, 'volume backed up');
+    } catch (err) {
+      logger.warn({ err, deploymentId }, 'volume backup failed, proceeding without safety net');
+    }
+
+    try {
+      // clear volume contents
       await this.docker.run(
         'alpine:latest',
         ['sh', '-c', 'rm -rf /dest/*'],
@@ -773,7 +867,25 @@ export class DeploymentExecutor extends EventEmitter {
 
       logger.info({ deploymentId, serviceName }, 'deployment files updated successfully');
     } catch (err) {
-      // try to restart container even if update failed
+      // restore from backup if download failed
+      try {
+        await this.docker.run(
+          'alpine:latest',
+          ['sh', '-c', 'cp -a /backup/. /dest/'],
+          process.stdout,
+          {
+            HostConfig: {
+              Binds: [`${backupVolumeName}:/backup:ro`, `${volumeName}:/dest`],
+              AutoRemove: true
+            }
+          }
+        );
+        logger.info({ deploymentId, serviceName }, 'restored volume from backup after failed update');
+      } catch (restoreErr) {
+        logger.error({ err: restoreErr }, 'failed to restore volume from backup');
+      }
+
+      // restart container even if update failed
       if (containerId) {
         try {
           const container = this.docker.getContainer(containerId);
@@ -783,6 +895,14 @@ export class DeploymentExecutor extends EventEmitter {
         }
       }
       throw err;
+    } finally {
+      // clean up backup volume
+      try {
+        const backup = this.docker.getVolume(backupVolumeName);
+        await backup.remove();
+      } catch {
+        // ignore cleanup errors
+      }
     }
   }
 

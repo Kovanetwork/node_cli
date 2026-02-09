@@ -37,7 +37,7 @@ export class AutoBidder {
   private config: AutoBidderConfig;
   private monitor: ResourceMonitor;
   private pollingInterval: NodeJS.Timeout | null = null;
-  private submittedBids: Set<string> = new Set();  // track orders we've already bid on
+  private submittedBids: Map<string, number> = new Map();  // orderId -> timestamp
 
   constructor(config: AutoBidderConfig, monitor: ResourceMonitor) {
     this.config = config;
@@ -111,7 +111,7 @@ export class AutoBidder {
           orderId: order.id,
           timestamp: orderTimestamp,
           ageInHours,
-          alreadyBid: this.submittedBids.has(order.id)
+          alreadyBid: this.submittedBids.has(order.id),
         }, 'order details');
       }
 
@@ -130,6 +130,14 @@ export class AutoBidder {
     if (this.submittedBids.has(order.id)) {
       logger.info({ orderId: order.id }, 'skipping - already bid in this session');
       return;
+    }
+
+    // evict stale bids to prevent unbounded growth
+    if (this.submittedBids.size > 5000) {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      for (const [id, ts] of this.submittedBids) {
+        if (ts < cutoff) this.submittedBids.delete(id);
+      }
     }
 
     // skip old orders (more than 7 days)
@@ -173,12 +181,12 @@ export class AutoBidder {
     try {
       await this.submitBid(order.id, ourPrice);
       // only add to set after successful bid
-      this.submittedBids.add(order.id);
+      this.submittedBids.set(order.id, Date.now());
       logger.info({ orderId: order.id }, 'bid successful');
     } catch (err: any) {
       if (err.message === 'already bid') {
         // we already bid on this in a previous run, remember it silently
-        this.submittedBids.add(order.id);
+        this.submittedBids.set(order.id, Date.now());
         return;
       }
       logger.error({ err, orderId: order.id }, 'failed to submit bid');

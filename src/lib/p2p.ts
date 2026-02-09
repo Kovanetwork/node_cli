@@ -13,16 +13,16 @@ export class P2PNode extends EventEmitter {
   private topic: Buffer;
   private connections: Map<string, any> = new Map();
   private signer: MessageSigner;
-  private keyPair: any;
+  private savedKeyPair: any;
 
   constructor(options: { port: number; bootstrapNodes: string[] }) {
     super();
     this.signer = new MessageSigner();
     this.topic = crypto.createHash('sha256').update('kova-network').digest();
-    this.keyPair = this.loadOrGenerateKeyPair();
+    this.savedKeyPair = this.loadKeyPair();
   }
 
-  private loadOrGenerateKeyPair() {
+  private loadKeyPair(): any {
     const kovaDir = join(homedir(), '.kova');
     const keyPath = join(kovaDir, 'node-keypair.json');
 
@@ -36,31 +36,37 @@ export class P2PNode extends EventEmitter {
         };
       }
     } catch (err) {
-      logger.warn({ err }, 'failed to load keypair, generating new one');
+      logger.warn({ err }, 'failed to load keypair, will generate on start');
     }
+    return null;
+  }
 
-    // generate new keypair
-    const publicKey = crypto.randomBytes(32);
-    const secretKey = crypto.randomBytes(32);
-
+  private saveKeyPair(keyPair: any): void {
+    const kovaDir = join(homedir(), '.kova');
+    const keyPath = join(kovaDir, 'node-keypair.json');
     try {
       if (!existsSync(kovaDir)) {
         mkdirSync(kovaDir, { recursive: true });
       }
       writeFileSync(keyPath, JSON.stringify({
-        publicKey: publicKey.toString('hex'),
-        secretKey: secretKey.toString('hex')
-      }));
-      logger.info('generated and saved new node keypair');
+        publicKey: keyPair.publicKey.toString('hex'),
+        secretKey: keyPair.secretKey.toString('hex')
+      }), { mode: 0o600 });
+      logger.info('saved node keypair');
     } catch (err) {
       logger.warn({ err }, 'failed to save keypair');
     }
-
-    return { publicKey, secretKey };
   }
 
   async start() {
-    this.swarm = new Hyperswarm({ keyPair: this.keyPair });
+    // let hyperswarm generate a proper noise keypair if we don't have one saved
+    const swarmOpts = this.savedKeyPair ? { keyPair: this.savedKeyPair } : {};
+    this.swarm = new Hyperswarm(swarmOpts);
+
+    // save the generated keypair for next run
+    if (!this.savedKeyPair && this.swarm.keyPair) {
+      this.saveKeyPair(this.swarm.keyPair);
+    }
 
     // join the kova network topic
     this.swarm.join(this.topic, { server: true, client: true });
@@ -72,8 +78,14 @@ export class P2PNode extends EventEmitter {
 
       logger.info({ connId, peer: info.publicKey.toString('hex') }, 'new peer connected');
 
-      // handle incoming messages
+      // handle incoming messages with size limit
+      const MAX_MESSAGE_SIZE = 1024 * 1024; // 1mb
       socket.on('data', (data: Buffer) => {
+        if (data.length > MAX_MESSAGE_SIZE) {
+          logger.warn({ connId, size: data.length }, 'message too large, dropping');
+          return;
+        }
+
         try {
           const signedMessage = JSON.parse(data.toString());
 

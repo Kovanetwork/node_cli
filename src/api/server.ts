@@ -207,12 +207,16 @@ export class NodeAPIServer {
 
         logger.info({ targetUrl, deploymentId }, 'proxying request');
 
+        // strip sensitive headers before forwarding to customer container
+        const forwardHeaders = { ...request.headers };
+        delete forwardHeaders['authorization'];
+        delete forwardHeaders['cookie'];
+        delete forwardHeaders['x-target-port'];
+        forwardHeaders.host = `${containerIP}:${targetPort}`;
+
         const proxyReq = http.request(targetUrl, {
           method: request.method,
-          headers: {
-            ...request.headers,
-            host: `${containerIP}:${targetPort}`
-          }
+          headers: forwardHeaders
         }, (proxyRes: any) => {
           reply.code(proxyRes.statusCode);
 

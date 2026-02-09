@@ -305,17 +305,18 @@ export class ContainerManager extends EventEmitter {
     return await this.docker.getContainerLogs(container.containerId, tail);
   }
 
-  // validate filepath to prevent path traversal attacks
+  // validate filepath to prevent path traversal and injection attacks
   private validateFilepath(filepath: string): void {
-    // block obvious traversal attempts
     if (filepath.includes('..') || filepath.includes('\0')) {
       throw new Error('invalid filepath - path traversal not allowed');
     }
-    // must be absolute path inside container
     if (!filepath.startsWith('/')) {
       throw new Error('filepath must be absolute (start with /)');
     }
-    // block access to sensitive paths
+    // block shell metacharacters to prevent injection
+    if (/[;|&$`\\!"'<>(){}\[\]\n\r]/.test(filepath)) {
+      throw new Error('filepath contains invalid characters');
+    }
     const blockedPaths = ['/proc', '/sys', '/dev', '/etc/passwd', '/etc/shadow'];
     for (const blocked of blockedPaths) {
       if (filepath.startsWith(blocked)) {
@@ -332,8 +333,9 @@ export class ContainerManager extends EventEmitter {
 
     this.validateFilepath(filepath);
 
-    // write file using heredoc
-    const command = `cat > ${filepath} << 'EOF'\n${content}\nEOF`;
+    // use base64 to safely transport content without shell injection
+    const encoded = Buffer.from(content, 'utf8').toString('base64');
+    const command = `echo '${encoded}' | base64 -d > '${filepath}'`;
     await this.docker.execCommand(container.containerId, command);
   }
 
@@ -345,7 +347,7 @@ export class ContainerManager extends EventEmitter {
 
     this.validateFilepath(filepath);
 
-    const result = await this.docker.execCommand(container.containerId, `cat ${filepath}`);
+    const result = await this.docker.execCommand(container.containerId, `cat '${filepath}'`);
     return result.stdout;
   }
 }

@@ -11,6 +11,7 @@ interface LeaseHandlerConfig {
   nodeId: string;
   providerId: string;
   orchestratorUrl: string;
+  apiKey?: string;
 }
 
 interface Lease {
@@ -35,14 +36,24 @@ export class LeaseHandler {
   private filesVersions: Map<string, number> = new Map();
   private restartAttempts: Map<string, number> = new Map();
 
+  // log batching - buffer logs per deployment and flush periodically
+  private logBuffer: Map<string, Array<{
+    serviceName: string;
+    logLine: string;
+    stream: 'stdout' | 'stderr';
+  }>> = new Map();
+  private logFlushInterval: NodeJS.Timeout | null = null;
+  private static readonly LOG_FLUSH_MS = 2000; // flush every 2 seconds
+  private static readonly LOG_BATCH_MAX = 50; // flush if buffer hits this size
+
   constructor(config: LeaseHandlerConfig, executor: DeploymentExecutor, p2pNode?: P2PNode) {
     this.config = config;
     this.executor = executor;
     this.p2pNode = p2pNode;
     this.docker = new Docker();
 
-    this.executor.on('log', async (logData) => {
-      await this.sendLogToOrchestrator(logData);
+    this.executor.on('log', (logData) => {
+      this.bufferLog(logData);
     });
 
     // setup p2p event listeners for real-time notifications
@@ -108,6 +119,48 @@ export class LeaseHandler {
     });
   }
 
+  // buffer a log line for batched sending
+  private bufferLog(logData: {
+    deploymentId: string;
+    serviceName: string;
+    logLine: string;
+    stream: 'stdout' | 'stderr';
+  }): void {
+    const { deploymentId, serviceName, logLine, stream } = logData;
+    let buffer = this.logBuffer.get(deploymentId);
+    if (!buffer) {
+      buffer = [];
+      this.logBuffer.set(deploymentId, buffer);
+    }
+    buffer.push({ serviceName, logLine, stream });
+
+    // flush immediately if buffer is full
+    if (buffer.length >= LeaseHandler.LOG_BATCH_MAX) {
+      this.flushLogs(deploymentId).catch(err => {
+        logger.warn({ err: err.message, deploymentId }, 'failed to flush logs');
+      });
+    }
+  }
+
+  // flush buffered logs for a deployment (or all if no id)
+  private async flushLogs(deploymentId?: string): Promise<void> {
+    const ids = deploymentId ? [deploymentId] : Array.from(this.logBuffer.keys());
+
+    for (const id of ids) {
+      const buffer = this.logBuffer.get(id);
+      if (!buffer || buffer.length === 0) continue;
+
+      // take the buffer and clear it
+      const logs = buffer.splice(0, buffer.length);
+
+      try {
+        await this.sendLogBatchToOrchestrator(id, logs);
+      } catch (err) {
+        logger.debug({ err, deploymentId: id, count: logs.length }, 'failed to send log batch');
+      }
+    }
+  }
+
   // start monitoring for new leases
   start(intervalMs: number = 10000): void {
     if (this.pollingInterval) {
@@ -133,6 +186,15 @@ export class LeaseHandler {
         logger.error({ err }, 'container health check failed');
       }
     }, 30000);
+
+    // start log flush timer
+    this.logFlushInterval = setInterval(async () => {
+      try {
+        await this.flushLogs();
+      } catch (err) {
+        logger.debug({ err }, 'log flush failed');
+      }
+    }, LeaseHandler.LOG_FLUSH_MS);
 
     // run immediately
     this.pollLeases();
@@ -221,6 +283,14 @@ export class LeaseHandler {
       clearInterval(this.healthCheckInterval);
       this.healthCheckInterval = null;
     }
+    if (this.logFlushInterval) {
+      clearInterval(this.logFlushInterval);
+      this.logFlushInterval = null;
+    }
+    // flush remaining logs before shutdown
+    this.flushLogs().catch(err => {
+      logger.warn({ err: err.message }, 'failed to flush remaining logs on shutdown');
+    });
     logger.info('lease handler stopped');
   }
 
@@ -243,6 +313,29 @@ export class LeaseHandler {
 
       // filter for this node
       const myLeases = leases.filter(l => l.nodeId === this.config.nodeId);
+      const activeDeploymentIds = new Set(myLeases.map(l => l.deploymentId));
+
+      // close deployments whose leases are no longer active
+      // check both tracked leases and discovered deployments (handles restart case)
+      const runningDeployments = new Set([
+        ...this.activeLeases,
+        ...this.executor.getRunningDeployments()
+      ]);
+
+      for (const deploymentId of runningDeployments) {
+        if (!activeDeploymentIds.has(deploymentId)) {
+          logger.info({ deploymentId }, 'lease no longer active - closing deployment');
+          try {
+            await this.executor.closeDeployment(deploymentId);
+            this.activeLeases.delete(deploymentId);
+            this.filesVersions.delete(deploymentId);
+            stateManager.removeDeployment(deploymentId);
+            logger.info({ deploymentId }, 'deployment closed after lease ended');
+          } catch (err) {
+            logger.error({ err, deploymentId }, 'failed to close deployment after lease ended');
+          }
+        }
+      }
 
       for (const lease of myLeases) {
         const deploymentRunning = this.executor.getDeployment(lease.deploymentId);
@@ -328,48 +421,42 @@ export class LeaseHandler {
     }
   }
 
-  // send log to orchestrator
-  private async sendLogToOrchestrator(logData: {
-    deploymentId: string;
-    serviceName: string;
-    logLine: string;
-    stream: 'stdout' | 'stderr';
-    timestamp: Date;
-  }): Promise<void> {
+  // send log batch to orchestrator
+  private async sendLogBatchToOrchestrator(
+    deploymentId: string,
+    logs: Array<{ serviceName: string; logLine: string; stream: 'stdout' | 'stderr' }>
+  ): Promise<void> {
     try {
-      const response = await fetch(`${this.config.orchestratorUrl}/api/v1/deployments/${logData.deploymentId}/logs/append`, {
+      const response = await fetch(`${this.config.orchestratorUrl}/api/v1/deployments/${deploymentId}/logs/batch`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${await this.getToken()}`
         },
-        body: JSON.stringify({
-          serviceName: logData.serviceName,
-          logLine: logData.logLine,
-          stream: logData.stream
-        })
+        body: JSON.stringify({ logs })
       });
 
       if (!response.ok) {
-        logger.debug({ deploymentId: logData.deploymentId }, 'failed to send log');
+        logger.debug({ deploymentId, count: logs.length }, 'failed to send log batch');
       }
     } catch (err) {
-      logger.debug({ err }, 'failed to send log to orchestrator');
+      logger.debug({ err }, 'failed to send log batch to orchestrator');
     }
   }
 
-  // get auth token
+  // get auth token using provider credentials
   private async getToken(): Promise<string> {
-    const response = await fetch(`${this.config.orchestratorUrl}/api/v1/auth/test-token`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        userId: this.config.providerId,
-        role: 'provider'
-      })
-    });
+    // prefer api key (sk_live_ format) for direct auth
+    if (this.config.apiKey) {
+      return this.config.apiKey;
+    }
 
-    const data: any = await response.json();
-    return data.token;
+    // fallback to provider token from environment
+    const providerToken = process.env.PROVIDER_TOKEN || '';
+    if (providerToken) {
+      return providerToken;
+    }
+
+    throw new Error('no api key or provider token configured');
   }
 }

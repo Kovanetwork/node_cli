@@ -198,7 +198,10 @@ export async function startNode(options: any) {
     // initialize deployment executor early if orchestrator configured
     let deploymentExecutor: DeploymentExecutor | null = null;
     if (config.orchestratorUrl && registered && registrationResult) {
-      deploymentExecutor = new DeploymentExecutor();
+      deploymentExecutor = new DeploymentExecutor({
+        orchestratorUrl: config.orchestratorUrl,
+        apiKey
+      });
 
       // discover any existing deployments from previous runs
       await deploymentExecutor.discoverExistingDeployments();
@@ -228,10 +231,18 @@ export async function startNode(options: any) {
         }
       });
 
-      // clean up processed jobs set periodically
+      // evict old entries instead of clearing everything
       setInterval(() => {
-        processedJobs.clear();
-      }, 5 * 60 * 1000); // every 5 minutes
+        // keep the set from growing unbounded but don't clear it wholesale
+        // which could cause duplicate processing
+        if (processedJobs.size > 10000) {
+          const entries = Array.from(processedJobs);
+          const toRemove = entries.slice(0, entries.length - 5000);
+          for (const id of toRemove) {
+            processedJobs.delete(id);
+          }
+        }
+      }, 5 * 60 * 1000);
     }
 
     // wire up earnings tracking
@@ -269,12 +280,12 @@ export async function startNode(options: any) {
       // use provider id from registration
       const providerId = registrationResult.providerId;
 
-      // ensure provider account exists
+      // verify provider account is registered
       try {
-        const providerRes = await fetch(`${config.orchestratorUrl}/api/v1/auth/test-token`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ userId: providerId, role: 'provider' })
+        const providerRes = await fetch(`${config.orchestratorUrl}/api/v1/provider/status`, {
+          headers: {
+            'Authorization': `Bearer ${apiKey}`
+          }
         });
         if (providerRes.ok) {
           logger.info({ providerId }, 'provider account ready');
@@ -309,7 +320,8 @@ export async function startNode(options: any) {
       leaseHandler = new LeaseHandler({
         nodeId,
         providerId,
-        orchestratorUrl: config.orchestratorUrl
+        orchestratorUrl: config.orchestratorUrl,
+        apiKey
       }, deploymentExecutor);
 
       leaseHandler.start(10000); // check for leases every 10s
@@ -364,9 +376,9 @@ export async function startNode(options: any) {
       logger.info('shell session handlers configured');
     }
 
-    // keep running until ctrl+c
-    process.on('SIGINT', async () => {
-      logger.info('shutting down...');
+    // graceful shutdown on both SIGINT and SIGTERM
+    const shutdown = async (signal: string) => {
+      logger.info({ signal }, 'shutting down...');
       stateManager.setStopped();
 
       if (autoBidder) {
@@ -386,7 +398,10 @@ export async function startNode(options: any) {
       await p2p.stop();
       await monitor.stop();
       process.exit(0);
-    });
+    };
+
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   } catch (err) {
     logger.error({ err }, 'failed to start');
