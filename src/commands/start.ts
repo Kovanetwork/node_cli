@@ -12,59 +12,69 @@ import { ResourceLimitManager } from '../lib/resource-limits.js';
 import { AutoBidder } from '../services/auto-bidder.js';
 import { LeaseHandler } from '../services/lease-handler.js';
 import { DeploymentExecutor } from '../services/deployment-executor.js';
+import { randomBytes } from 'crypto';
 
 async function registerWithOrchestrator(
   nodeId: string,
   resources: any,
   apiKey?: string,
   walletAddress?: string,
-  orchestratorUrl?: string
+  orchestratorUrl?: string,
+  maxRetries: number = 5
 ): Promise<{ providerId: string; walletAddress?: string } | null> {
   if (!orchestratorUrl) {
     logger.warn('no orchestrator URL configured, skipping HTTP registration');
     return null;
   }
 
-  try {
-    const body: any = {
-      nodeId,
-      resources,
-      timestamp: Date.now(),
-      version: '0.0.1'
-    };
+  const body: any = {
+    nodeId,
+    resources,
+    timestamp: Date.now(),
+    version: '0.0.1'
+  };
 
-    // prefer api key over wallet
-    if (apiKey) {
-      body.apiKey = apiKey;
-    } else if (walletAddress) {
-      body.walletAddress = walletAddress;
-    }
-
-    const response = await fetch(`${orchestratorUrl}/api/v1/nodes/register`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body)
-    });
-
-    if (response.ok) {
-      const data: any = await response.json();
-      logger.info({
-        orchestratorUrl,
-        walletAddress: data.walletAddress,
-        providerId: data.providerId
-      }, 'registered with orchestrator');
-      return {
-        providerId: data.providerId,
-        walletAddress: data.walletAddress
-      };
-    } else {
-      logger.warn({ status: response.status }, 'failed to register with orchestrator');
-      return null;
-    }
-  } catch (err) {
-    logger.warn({ err }, 'could not reach orchestrator for HTTP registration');
-    return null;
+  // prefer api key over wallet
+  if (apiKey) {
+    body.apiKey = apiKey;
+  } else if (walletAddress) {
+    body.walletAddress = walletAddress;
   }
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await fetch(`${orchestratorUrl}/api/v1/nodes/register`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+
+      if (response.ok) {
+        const data: any = await response.json();
+        logger.info({
+          orchestratorUrl,
+          walletAddress: data.walletAddress,
+          providerId: data.providerId
+        }, 'registered with orchestrator');
+        return {
+          providerId: data.providerId,
+          walletAddress: data.walletAddress
+        };
+      } else {
+        logger.warn({ status: response.status, attempt }, 'failed to register with orchestrator');
+      }
+    } catch (err) {
+      logger.warn({ err, attempt, maxRetries }, 'could not reach orchestrator for HTTP registration');
+    }
+
+    if (attempt < maxRetries) {
+      const delay = Math.min(attempt * 3000, 15000);
+      logger.info({ attempt, nextRetryMs: delay }, 'retrying registration...');
+      await new Promise(resolve => setTimeout(resolve, delay));
+    }
+  }
+
+  return null;
 }
 
 export async function startNode(options: any) {
@@ -179,10 +189,14 @@ export async function startNode(options: any) {
       console.log('Check orchestrator connection and try again\n');
     }
 
+    // generate access token for orchestrator → provider shell proxy auth
+    const accessToken = randomBytes(32).toString('hex');
+    const apiPort = config.apiPort || 4002;
+
     // start heartbeat service to keep orchestrator updated
     let heartbeat: HeartbeatService | null = null;
     if (config.orchestratorUrl) {
-      heartbeat = new HeartbeatService(nodeId, config.orchestratorUrl, monitor, limitManager, 60);
+      heartbeat = new HeartbeatService(nodeId, config.orchestratorUrl, monitor, limitManager, 60, apiPort, accessToken);
       await heartbeat.start();
       logger.info('heartbeat service started - sending status every 60 seconds');
     } else {
@@ -195,9 +209,10 @@ export async function startNode(options: any) {
 
     const jobHandler = new JobHandler(p2p, containerMgr, limitManager, config.orchestratorUrl);
 
-    // initialize deployment executor early if orchestrator configured
+    // initialize deployment executor whenever orchestrator is configured
+    // shell sessions and stats only need local docker access, not registration
     let deploymentExecutor: DeploymentExecutor | null = null;
-    if (config.orchestratorUrl && registered && registrationResult) {
+    if (config.orchestratorUrl) {
       deploymentExecutor = new DeploymentExecutor({
         orchestratorUrl: config.orchestratorUrl,
         apiKey
@@ -210,7 +225,7 @@ export async function startNode(options: any) {
     }
 
     // start api server for exec/logs (with deployment executor if available)
-    const apiServer = new NodeAPIServer(containerMgr, deploymentExecutor || undefined, 4002);
+    const apiServer = new NodeAPIServer(containerMgr, deploymentExecutor || undefined, apiPort, accessToken);
     await apiServer.start();
 
     // listen for pending jobs from heartbeat

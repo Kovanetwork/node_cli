@@ -38,6 +38,10 @@ export class AutoBidder {
   private monitor: ResourceMonitor;
   private pollingInterval: NodeJS.Timeout | null = null;
   private submittedBids: Map<string, number> = new Map();  // orderId -> timestamp
+  // dynamic pricing state
+  private bidHistory: Array<{ price: number; won: boolean; timestamp: number }> = [];
+  private dynamicPriceMultiplier: number = 1.0;
+  private lastPriceAdjustment: number = 0;
 
   constructor(config: AutoBidderConfig, monitor: ResourceMonitor) {
     this.config = config;
@@ -272,8 +276,51 @@ export class AutoBidder {
     return true;
   }
 
-  // calculate competitive bid price
+  // adjust dynamic pricing based on bid history and utilization
+  private adjustDynamicPricing(): void {
+    const now = Date.now();
+    const fiveMinutes = 5 * 60 * 1000;
+
+    // only adjust every 5 minutes
+    if (now - this.lastPriceAdjustment < fiveMinutes) return;
+    this.lastPriceAdjustment = now;
+
+    // prune old history (keep last hour)
+    const oneHourAgo = now - 60 * 60 * 1000;
+    this.bidHistory = this.bidHistory.filter(b => b.timestamp > oneHourAgo);
+
+    if (this.bidHistory.length < 3) return; // not enough data
+
+    // calculate win rate
+    const totalBids = this.bidHistory.length;
+    const wonBids = this.bidHistory.filter(b => b.won).length;
+    const winRate = wonBids / totalBids;
+
+    // adjust multiplier based on win rate
+    if (winRate > 0.7) {
+      // winning too many - we can raise prices
+      this.dynamicPriceMultiplier = Math.min(this.dynamicPriceMultiplier * 1.05, 2.0);
+      logger.info({ winRate, multiplier: this.dynamicPriceMultiplier }, 'raising prices - high win rate');
+    } else if (winRate < 0.2) {
+      // losing too many - lower prices to be more competitive
+      this.dynamicPriceMultiplier = Math.max(this.dynamicPriceMultiplier * 0.95, 0.5);
+      logger.info({ winRate, multiplier: this.dynamicPriceMultiplier }, 'lowering prices - low win rate');
+    }
+  }
+
+  // record a bid result for dynamic pricing
+  recordBidResult(orderId: string, won: boolean): void {
+    const bid = this.bidHistory.find(b => (b as any).orderId === orderId);
+    if (bid) {
+      bid.won = won;
+    }
+  }
+
+  // calculate competitive bid price with dynamic adjustment
   private calculateBidPrice(order: Order): number {
+    // adjust pricing periodically based on history
+    this.adjustDynamicPricing();
+
     const cpu = order.resources.cpu;
     const memory = this.parseMemoryToGb(order.resources.memory);
 
@@ -290,13 +337,25 @@ export class AutoBidder {
 
     const baseCost = cpuCost + memoryCost + gpuCost;
 
-    // add margin
-    let price = baseCost * this.config.pricingStrategy.margin;
+    // apply margin and dynamic multiplier
+    let price = baseCost * this.config.pricingStrategy.margin * this.dynamicPriceMultiplier;
+
+    // factor in utilization - higher util = higher prices
+    this.monitor.getAvailableResources().then(resources => {
+      const cpuUtil = 1 - (resources.cpu.available / resources.cpu.cores);
+      if (cpuUtil > 0.8) {
+        // when heavily utilized, charge a premium
+        price *= 1.15;
+      }
+    }).catch(() => {});
 
     // minimum bid to ensure non-zero pricing
     if (price < 0.001) {
       price = 0.001;
     }
+
+    // track this bid for win rate calculations
+    this.bidHistory.push({ price, won: false, timestamp: Date.now() });
 
     // round to 4 decimals for precision
     return Math.round(price * 10000) / 10000;

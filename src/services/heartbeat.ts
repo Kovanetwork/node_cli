@@ -11,13 +11,17 @@ export class HeartbeatService extends EventEmitter {
   private interval: NodeJS.Timeout | null = null;
   private heartbeatIntervalMs: number;
   private isRunning: boolean = false;
+  private apiPort: number;
+  private accessToken: string;
 
   constructor(
     nodeId: string,
     orchestratorUrl: string,
     monitor: ResourceMonitor,
     limitManager: ResourceLimitManager,
-    intervalSeconds: number = 60
+    intervalSeconds: number = 60,
+    apiPort: number = 4002,
+    accessToken: string = ''
   ) {
     super();
     this.nodeId = nodeId;
@@ -25,6 +29,8 @@ export class HeartbeatService extends EventEmitter {
     this.monitor = monitor;
     this.limitManager = limitManager;
     this.heartbeatIntervalMs = intervalSeconds * 1000;
+    this.apiPort = apiPort;
+    this.accessToken = accessToken;
   }
 
   async start(): Promise<void> {
@@ -87,7 +93,11 @@ export class HeartbeatService extends EventEmitter {
           headers: {
             'Content-Type': 'application/json',
           },
-          body: JSON.stringify({ resources }),
+          body: JSON.stringify({
+            resources,
+            apiPort: this.apiPort,
+            accessToken: this.accessToken,
+          }),
         }
       );
 

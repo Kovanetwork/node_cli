@@ -7,6 +7,13 @@ import { logger } from '../lib/logger.js';
 import Docker from 'dockerode';
 import { randomBytes, createHash } from 'crypto';
 
+interface RegistryCredentials {
+  host: string;
+  username: string;
+  password: string;
+  email?: string;
+}
+
 interface Service {
   image: string;
   command?: string[];  // docker cmd override
@@ -18,6 +25,8 @@ interface Service {
     to?: Array<{ global?: boolean; service?: string }>;
     proto?: string;
   }>;
+  depends_on?: string[];
+  credentials?: RegistryCredentials;
   params?: {
     storage?: Record<string, {
       mount: string;
@@ -50,6 +59,8 @@ interface DeploymentExecution {
   containers: Map<string, string>; // serviceName -> containerId
   networks: string[];
   volumes: string[];
+  restartPolicy?: 'no' | 'always' | 'on-failure' | 'unless-stopped';
+  restartMaxRetries?: number;
 }
 
 export class DeploymentExecutor extends EventEmitter {
@@ -143,10 +154,16 @@ export class DeploymentExecutor extends EventEmitter {
         }
       }
 
-      // start each service
-      for (const [serviceName, service] of Object.entries(manifest.services)) {
+      // sort services by depends_on so dependencies start first (topological order)
+      const serviceEntries = Object.entries(manifest.services);
+      const sorted = this.topologicalSort(serviceEntries);
+
+      // start each service in dependency order, respecting replica count
+      for (const [serviceName, service] of sorted) {
         // extract gpu config from profiles if available
         let gpu: GpuConfig | undefined;
+        let replicaCount = 1;
+
         if (manifest.profiles?.compute) {
           // find matching compute profile for this service
           for (const [profileName, profile] of Object.entries<any>(manifest.profiles.compute)) {
@@ -156,7 +173,27 @@ export class DeploymentExecutor extends EventEmitter {
             }
           }
         }
-        await this.startService(deploymentId, serviceName, service, execution, networkName, gpu);
+
+        // get replica count from deployment section
+        const serviceDeployment = manifest.deployment?.[serviceName];
+        if (serviceDeployment) {
+          for (const [, config] of Object.entries<any>(serviceDeployment)) {
+            if (config?.count && config.count > 1) {
+              replicaCount = Math.min(config.count, 20); // cap at 20 replicas
+              break;
+            }
+          }
+        }
+
+        if (replicaCount > 1) {
+          logger.info({ deploymentId, serviceName, replicaCount }, 'starting service replicas');
+          for (let i = 0; i < replicaCount; i++) {
+            const replicaName = `${serviceName}-${i}`;
+            await this.startService(deploymentId, replicaName, service, execution, networkName, gpu);
+          }
+        } else {
+          await this.startService(deploymentId, serviceName, service, execution, networkName, gpu);
+        }
       }
 
       this.emit('deployment-started', { deploymentId, leaseId });
@@ -204,14 +241,43 @@ export class DeploymentExecutor extends EventEmitter {
       }
     }
 
-    // setup volume binds
+    // setup volume binds and tmpfs mounts for ram class storage
     const binds: string[] = [];
+    const tmpfs: Record<string, string> = {};
+
     if (service.params?.storage) {
+      // look up storage resources from the compute profile to check classes
+      const serviceDeployment = execution?.manifest?.deployment?.[serviceName];
+      let storageResources: any[] = [];
+      if (serviceDeployment) {
+        for (const [, config] of Object.entries<any>(serviceDeployment)) {
+          if (config?.profile) {
+            const profile = execution?.manifest?.profiles?.compute?.[config.profile];
+            if (profile?.resources?.storage) {
+              storageResources = Array.isArray(profile.resources.storage)
+                ? profile.resources.storage : [profile.resources.storage];
+            }
+            break;
+          }
+        }
+      }
+
       for (const [volumeName, volumeConfig] of Object.entries(service.params.storage)) {
-        const volumeFullName = `kova-${deploymentId}-${serviceName}-${volumeName}`;
         const mountPath = volumeConfig.mount;
-        const mode = volumeConfig.readOnly ? 'ro' : 'rw';
-        binds.push(`${volumeFullName}:${mountPath}:${mode}`);
+
+        // check if this volume's storage class is 'ram' (shared memory / tmpfs)
+        const matchingStorage = storageResources.find((s: any) => s.name === volumeName);
+        if (matchingStorage?.attributes?.class === 'ram') {
+          // create tmpfs mount instead of docker volume
+          const sizeBytes = this.parseMemoryToBytes(matchingStorage.size || '64Mi');
+          tmpfs[mountPath] = `size=${sizeBytes}`;
+          logger.info({ deploymentId, serviceName, volumeName, mountPath, size: matchingStorage.size },
+            'using tmpfs for ram class storage');
+        } else {
+          const volumeFullName = `kova-${deploymentId}-${serviceName}-${volumeName}`;
+          const mode = volumeConfig.readOnly ? 'ro' : 'rw';
+          binds.push(`${volumeFullName}:${mountPath}:${mode}`);
+        }
       }
     }
 
@@ -226,9 +292,9 @@ export class DeploymentExecutor extends EventEmitter {
       }
     }
 
-    // pull image first
+    // pull image first (pass credentials for private registries)
     try {
-      await this.pullImage(service.image, deploymentId, serviceName);
+      await this.pullImage(service.image, deploymentId, serviceName, service.credentials);
     } catch (err) {
       logger.error({ err, image: service.image }, 'failed to pull image');
       throw err;
@@ -309,7 +375,12 @@ export class DeploymentExecutor extends EventEmitter {
           Binds: binds,
           ReadonlyRootfs: false,
           AutoRemove: false,
-          RestartPolicy: { Name: 'no' },
+          RestartPolicy: {
+            Name: execution.restartPolicy || 'on-failure',
+            MaximumRetryCount: (execution.restartPolicy || 'on-failure') === 'on-failure'
+              ? (execution.restartMaxRetries || 3)
+              : 0
+          },
           // resource limits based on what was ordered
           Memory: memoryLimit,
           MemorySwap: memoryLimit,
@@ -317,9 +388,10 @@ export class DeploymentExecutor extends EventEmitter {
           CpuQuota: Math.floor(cpuCores * 100000),
           Privileged: false,
           PidsLimit: 256,
-          SecurityOpt: ['no-new-privileges:true'],
           CapDrop: ['ALL'],
-          CapAdd: ['CHOWN', 'NET_BIND_SERVICE']
+          CapAdd: ['CHOWN', 'NET_BIND_SERVICE', 'SETUID', 'SETGID', 'DAC_OVERRIDE'],
+          // tmpfs mounts for ram class storage (shared memory)
+          ...(Object.keys(tmpfs).length > 0 ? { Tmpfs: tmpfs } : {})
         },
         Labels: {
           'kova.deployment': deploymentId,
@@ -365,10 +437,22 @@ export class DeploymentExecutor extends EventEmitter {
     this.streamLogs(container, deploymentId, serviceName);
   }
 
-  // pull docker image with progress
-  private async pullImage(image: string, deploymentId: string, serviceName: string): Promise<void> {
+  // pull docker image with progress, optionally using private registry credentials
+  private async pullImage(image: string, deploymentId: string, serviceName: string, credentials?: RegistryCredentials): Promise<void> {
+    const pullOptions: any = {};
+
+    if (credentials) {
+      pullOptions.authconfig = {
+        username: credentials.username,
+        password: credentials.password,
+        serveraddress: credentials.host,
+        ...(credentials.email ? { email: credentials.email } : {})
+      };
+      logger.info({ deploymentId, serviceName, registry: credentials.host }, 'using private registry credentials');
+    }
+
     return new Promise((resolve, reject) => {
-      this.docker.pull(image, (err: any, stream: any) => {
+      this.docker.pull(image, pullOptions, (err: any, stream: any) => {
         if (err) {
           return reject(err);
         }
@@ -537,6 +621,130 @@ export class DeploymentExecutor extends EventEmitter {
     }
   }
 
+  // topological sort of services by depends_on (dependencies start first)
+  private topologicalSort(services: [string, Service][]): [string, Service][] {
+    const serviceMap = new Map(services);
+    const sorted: [string, Service][] = [];
+    const visited = new Set<string>();
+    const visiting = new Set<string>(); // cycle detection
+
+    const visit = (name: string) => {
+      if (visited.has(name)) return;
+      if (visiting.has(name)) {
+        logger.warn({ service: name }, 'circular dependency detected, breaking cycle');
+        return;
+      }
+
+      visiting.add(name);
+
+      const service = serviceMap.get(name);
+      if (service?.depends_on) {
+        for (const dep of service.depends_on) {
+          if (serviceMap.has(dep)) {
+            visit(dep);
+          } else {
+            logger.warn({ service: name, dependency: dep }, 'depends_on references unknown service, ignoring');
+          }
+        }
+      }
+
+      visiting.delete(name);
+      visited.add(name);
+      if (service) {
+        sorted.push([name, service]);
+      }
+    };
+
+    for (const [name] of services) {
+      visit(name);
+    }
+
+    return sorted;
+  }
+
+  // get docker events for containers in a deployment
+  async getContainerEvents(deploymentId: string): Promise<any> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      return { error: 'deployment not found', events: [] };
+    }
+
+    const containerIds = Array.from(execution.containers.values());
+    if (containerIds.length === 0) {
+      return { deploymentId, events: [] };
+    }
+
+    const events: any[] = [];
+
+    for (const [serviceName, containerId] of execution.containers.entries()) {
+      try {
+        const container = this.docker.getContainer(containerId);
+        const info = await container.inspect();
+
+        // synthesize events from container state
+        events.push({
+          type: 'container',
+          action: 'create',
+          service: serviceName,
+          containerId: containerId.slice(0, 12),
+          image: info.Config.Image,
+          time: new Date(info.Created).toISOString()
+        });
+
+        if (info.State.StartedAt && info.State.StartedAt !== '0001-01-01T00:00:00Z') {
+          events.push({
+            type: 'container',
+            action: 'start',
+            service: serviceName,
+            containerId: containerId.slice(0, 12),
+            image: info.Config.Image,
+            time: info.State.StartedAt
+          });
+        }
+
+        if (info.State.FinishedAt && info.State.FinishedAt !== '0001-01-01T00:00:00Z' && !info.State.Running) {
+          events.push({
+            type: 'container',
+            action: 'stop',
+            service: serviceName,
+            containerId: containerId.slice(0, 12),
+            exitCode: info.State.ExitCode,
+            time: info.State.FinishedAt
+          });
+        }
+
+        // check health status if configured
+        if (info.State.Health) {
+          const health = info.State.Health;
+          events.push({
+            type: 'health',
+            action: health.Status, // healthy, unhealthy, starting
+            service: serviceName,
+            containerId: containerId.slice(0, 12),
+            failingStreak: health.FailingStreak,
+            time: health.Log?.length > 0
+              ? health.Log[health.Log.length - 1].End
+              : new Date().toISOString()
+          });
+        }
+      } catch (err: any) {
+        events.push({
+          type: 'error',
+          action: 'inspect_failed',
+          service: serviceName,
+          containerId: containerId.slice(0, 12),
+          error: err.message,
+          time: new Date().toISOString()
+        });
+      }
+    }
+
+    // sort events by time
+    events.sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+
+    return { deploymentId, timestamp: Date.now(), events };
+  }
+
   // get running deployments
   getRunningDeployments(): string[] {
     return Array.from(this.executions.keys());
@@ -545,6 +753,127 @@ export class DeploymentExecutor extends EventEmitter {
   // get deployment info
   getDeployment(deploymentId: string): DeploymentExecution | undefined {
     return this.executions.get(deploymentId);
+  }
+
+  // get real-time docker stats for all containers in a deployment
+  async getDeploymentStats(deploymentId: string): Promise<any> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      return { error: 'deployment not found', services: {} };
+    }
+
+    const services: Record<string, any> = {};
+
+    for (const [serviceName, containerId] of execution.containers.entries()) {
+      try {
+        const container = this.docker.getContainer(containerId);
+        // one-shot stats (stream: false) to avoid hanging
+        const stats = await container.stats({ stream: false });
+
+        // calculate cpu usage percentage
+        const cpuDelta = stats.cpu_stats.cpu_usage.total_usage - (stats.precpu_stats?.cpu_usage?.total_usage || 0);
+        const systemDelta = stats.cpu_stats.system_cpu_usage - (stats.precpu_stats?.system_cpu_usage || 0);
+        const numCpus = stats.cpu_stats.online_cpus || stats.cpu_stats.cpu_usage?.percpu_usage?.length || 1;
+        const cpuPercent = systemDelta > 0 ? (cpuDelta / systemDelta) * numCpus * 100 : 0;
+
+        // memory
+        const memUsage = stats.memory_stats.usage || 0;
+        const memLimit = stats.memory_stats.limit || 0;
+        const memCache = stats.memory_stats.stats?.cache || 0;
+        const memActual = memUsage - memCache;
+        const memPercent = memLimit > 0 ? (memActual / memLimit) * 100 : 0;
+
+        // network i/o
+        let netRx = 0, netTx = 0;
+        if (stats.networks) {
+          for (const iface of Object.values(stats.networks) as any[]) {
+            netRx += iface.rx_bytes || 0;
+            netTx += iface.tx_bytes || 0;
+          }
+        }
+
+        // block i/o
+        let blockRead = 0, blockWrite = 0;
+        if (stats.blkio_stats?.io_service_bytes_recursive) {
+          for (const entry of stats.blkio_stats.io_service_bytes_recursive) {
+            if (entry.op === 'read' || entry.op === 'Read') blockRead += entry.value;
+            if (entry.op === 'write' || entry.op === 'Write') blockWrite += entry.value;
+          }
+        }
+
+        services[serviceName] = {
+          containerId: containerId.slice(0, 12),
+          cpu: { percent: Math.round(cpuPercent * 100) / 100, cores: numCpus },
+          memory: {
+            used: memActual,
+            limit: memLimit,
+            percent: Math.round(memPercent * 100) / 100,
+            usedFormatted: this.formatBytes(memActual),
+            limitFormatted: this.formatBytes(memLimit)
+          },
+          network: {
+            rx: netRx,
+            tx: netTx,
+            rxFormatted: this.formatBytes(netRx),
+            txFormatted: this.formatBytes(netTx)
+          },
+          blockIo: {
+            read: blockRead,
+            write: blockWrite,
+            readFormatted: this.formatBytes(blockRead),
+            writeFormatted: this.formatBytes(blockWrite)
+          },
+          pids: stats.pids_stats?.current || 0
+        };
+      } catch (err: any) {
+        services[serviceName] = { error: err.message, containerId: containerId.slice(0, 12) };
+      }
+    }
+
+    return { deploymentId, timestamp: Date.now(), services };
+  }
+
+  // format bytes to human readable
+  private formatBytes(bytes: number): string {
+    if (bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(1024));
+    return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
+  }
+
+  // get container running status for all services in a deployment
+  async getDeploymentStatus(deploymentId: string): Promise<any> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      return { error: 'deployment not found', services: {} };
+    }
+
+    const services: Record<string, any> = {};
+
+    for (const [serviceName, containerId] of execution.containers.entries()) {
+      try {
+        const container = this.docker.getContainer(containerId);
+        const info = await container.inspect();
+        services[serviceName] = {
+          containerId: containerId.slice(0, 12),
+          running: info.State.Running,
+          status: info.State.Status, // running, exited, paused, restarting, dead
+          startedAt: info.State.StartedAt,
+          finishedAt: info.State.FinishedAt,
+          exitCode: info.State.ExitCode,
+          restartCount: info.RestartCount,
+          image: info.Config.Image,
+          ports: Object.keys(info.Config.ExposedPorts || {}).map(p => {
+            const [port, proto] = p.split('/');
+            return { port: parseInt(port), protocol: proto || 'tcp' };
+          })
+        };
+      } catch (err: any) {
+        services[serviceName] = { error: err.message, containerId: containerId.slice(0, 12) };
+      }
+    }
+
+    return { deploymentId, timestamp: Date.now(), services };
   }
 
   // discover existing deployments on startup
@@ -906,25 +1235,288 @@ export class DeploymentExecutor extends EventEmitter {
     }
   }
 
+  // browse files inside a running container
+  async browseFiles(deploymentId: string, serviceName: string, dirPath: string = '/'): Promise<any> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      return { error: 'deployment not found', files: [] };
+    }
+
+    let containerId = execution.containers.get(serviceName);
+    if (!containerId && execution.containers.size > 0) {
+      containerId = execution.containers.entries().next().value![1];
+    }
+    if (!containerId) {
+      return { error: 'no containers found', files: [] };
+    }
+
+    try {
+      const container = this.docker.getContainer(containerId);
+
+      // try gnu ls first, fall back to plain ls -la for busybox
+      let lsCmd = ['ls', '-laF', dirPath];
+      const exec = await container.exec({
+        Cmd: lsCmd,
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const stream = await exec.start({ hijack: true, stdin: false });
+      const output = await this.collectExecOutput(stream);
+
+      const files: any[] = [];
+      const lines = output.stdout.split('\n').filter((l: string) => l.trim() && !l.startsWith('total'));
+
+      for (const line of lines) {
+        // try iso format first: -rw-r--r-- 1 root root 123 2026-02-11 09:54 file.txt
+        let match = line.match(/^([drwxlstSTrw\-\.]+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\d{4}-\d{2}-\d{2})\s+(\d{2}:\d{2})\s+(.+)$/);
+        let dateStr = '';
+
+        if (match) {
+          dateStr = `${match[6]} ${match[7]}`;
+        } else {
+          // busybox format: -rw-r--r-- 1 root root 123 Feb 11 09:54 file.txt
+          match = line.match(/^([drwxlstSTrw\-\.]+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\d+)\s+(\w{3}\s+\d{1,2}\s+[\d:]+)\s+(.+)$/);
+          if (match) {
+            dateStr = match[6];
+            // shift: busybox match has 7 groups (date is one field, name is match[7])
+            match = [match[0], match[1], match[2], match[3], match[4], match[5], match[6], '', match[7]];
+          }
+        }
+
+        if (!match) continue;
+
+        const permissions = match[1];
+        const owner = match[3];
+        const group = match[4];
+        const size = match[5];
+        const rawName = match[8];
+        const isDir = permissions.startsWith('d');
+        const isLink = permissions.startsWith('l');
+        let name = rawName;
+        let linkTarget = '';
+
+        // remove trailing / or @ or * from name (added by -F flag)
+        if (isDir && name.endsWith('/')) name = name.slice(0, -1);
+        if (name.endsWith('*')) name = name.slice(0, -1);
+        if (name.endsWith('@')) name = name.slice(0, -1);
+
+        // handle symlinks: name -> target
+        if (isLink && name.includes(' -> ')) {
+          const parts = name.split(' -> ');
+          name = parts[0];
+          linkTarget = parts[1];
+        }
+
+        // skip . and ..
+        if (name === '.' || name === '..') continue;
+
+        files.push({
+          name,
+          path: dirPath === '/' ? `/${name}` : `${dirPath}/${name}`,
+          type: isDir ? 'directory' : isLink ? 'link' : 'file',
+          size: parseInt(size),
+          permissions,
+          owner,
+          group,
+          modified: dateStr,
+          linkTarget: linkTarget || undefined
+        });
+      }
+
+      // sort: directories first, then alphabetical
+      files.sort((a, b) => {
+        if (a.type === 'directory' && b.type !== 'directory') return -1;
+        if (a.type !== 'directory' && b.type === 'directory') return 1;
+        return a.name.localeCompare(b.name);
+      });
+
+      return { path: dirPath, files };
+    } catch (err: any) {
+      logger.error({ err, deploymentId, dirPath }, 'failed to browse files');
+      return { error: err.message, files: [] };
+    }
+  }
+
+  // read a file from inside a container
+  async readContainerFile(deploymentId: string, serviceName: string, filePath: string): Promise<any> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      return { error: 'deployment not found' };
+    }
+
+    let containerId = execution.containers.get(serviceName);
+    if (!containerId && execution.containers.size > 0) {
+      containerId = execution.containers.entries().next().value![1];
+    }
+    if (!containerId) {
+      return { error: 'no containers found' };
+    }
+
+    try {
+      const container = this.docker.getContainer(containerId);
+
+      // check file size first (reject files > 5MB)
+      const statExec = await container.exec({
+        Cmd: ['stat', '-c', '%s', filePath],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const statStream = await statExec.start({ hijack: true, stdin: false });
+      const statOutput = await this.collectExecOutput(statStream);
+
+      if (statOutput.stderr.includes('No such file')) {
+        return { error: 'file not found' };
+      }
+
+      const fileSize = parseInt(statOutput.stdout.trim());
+      if (fileSize > 5 * 1024 * 1024) {
+        return { error: 'file too large (max 5MB)', size: fileSize };
+      }
+
+      // read the file content using base64 to handle binary safely
+      const exec = await container.exec({
+        Cmd: ['base64', filePath],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const stream = await exec.start({ hijack: true, stdin: false });
+      const output = await this.collectExecOutput(stream);
+
+      if (output.stderr && output.stderr.includes('No such file')) {
+        return { error: 'file not found' };
+      }
+
+      const content = Buffer.from(output.stdout.replace(/\s/g, ''), 'base64').toString('utf8');
+
+      // detect if binary (has null bytes or high ratio of non-printable chars)
+      const nonPrintable = content.split('').filter(c => {
+        const code = c.charCodeAt(0);
+        return code < 32 && code !== 9 && code !== 10 && code !== 13;
+      }).length;
+      const isBinary = nonPrintable > content.length * 0.1;
+
+      return {
+        path: filePath,
+        size: fileSize,
+        content: isBinary ? undefined : content,
+        binary: isBinary,
+        encoding: isBinary ? 'base64' : 'utf8',
+        rawBase64: isBinary ? output.stdout.replace(/\s/g, '') : undefined
+      };
+    } catch (err: any) {
+      logger.error({ err, deploymentId, filePath }, 'failed to read container file');
+      return { error: err.message };
+    }
+  }
+
+  // upload a file into a running container
+  async uploadFileToContainer(deploymentId: string, serviceName: string, filePath: string, content: string, encoding: 'utf8' | 'base64' = 'utf8'): Promise<any> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      return { success: false, error: 'deployment not found' };
+    }
+
+    let containerId = execution.containers.get(serviceName);
+    if (!containerId && execution.containers.size > 0) {
+      containerId = execution.containers.entries().next().value![1];
+    }
+    if (!containerId) {
+      return { success: false, error: 'no containers found' };
+    }
+
+    // validate path (prevent path traversal)
+    if (filePath.includes('..') || !filePath.startsWith('/')) {
+      return { success: false, error: 'invalid file path' };
+    }
+
+    try {
+      const container = this.docker.getContainer(containerId);
+
+      // ensure parent directory exists
+      const parentDir = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
+      const mkdirExec = await container.exec({
+        Cmd: ['mkdir', '-p', parentDir],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const mkdirStream = await mkdirExec.start({ hijack: true, stdin: false });
+      await this.collectExecOutput(mkdirStream);
+
+      // write file using base64 decode via shell
+      const b64Content = encoding === 'base64' ? content : Buffer.from(content, 'utf8').toString('base64');
+      const exec = await container.exec({
+        Cmd: ['sh', '-c', `echo '${b64Content}' | base64 -d > ${filePath}`],
+        AttachStdout: true,
+        AttachStderr: true,
+      });
+      const stream = await exec.start({ hijack: true, stdin: false });
+      const output = await this.collectExecOutput(stream);
+
+      if (output.stderr && !output.stderr.includes('warning')) {
+        return { success: false, error: output.stderr.trim() };
+      }
+
+      logger.info({ deploymentId, filePath }, 'file uploaded to container');
+      return { success: true, path: filePath };
+    } catch (err: any) {
+      logger.error({ err, deploymentId, filePath }, 'failed to upload file to container');
+      return { success: false, error: err.message };
+    }
+  }
+
+  // collect output from a docker exec stream
+  private collectExecOutput(stream: any): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve) => {
+      let stdout = '';
+      let stderr = '';
+      const timeout = setTimeout(() => {
+        resolve({ stdout, stderr: stderr || 'command timed out' });
+      }, 10000);
+
+      stream.on('data', (chunk: Buffer) => {
+        // docker multiplexes: first 8 bytes are header
+        // byte 0: stream type (1=stdout, 2=stderr)
+        // bytes 4-7: payload size
+        const data = chunk.toString('utf8');
+        stdout += data;
+      });
+
+      stream.on('end', () => {
+        clearTimeout(timeout);
+        // strip docker header bytes if present
+        const clean = stdout.replace(/[\x00-\x08]/g, '');
+        resolve({ stdout: clean, stderr });
+      });
+
+      stream.on('error', (err: any) => {
+        clearTimeout(timeout);
+        resolve({ stdout, stderr: err.message });
+      });
+    });
+  }
+
   // shell session tracking
   private shellSessions: Map<string, {
     exec: any;
     stream: any;
     deploymentId: string;
     serviceName: string;
+    debugContainer?: any; // temp container created for shell when original exits immediately
+    debugImageTag?: string; // committed snapshot image to clean up
   }> = new Map();
 
   // start interactive shell session in container
+  // returns { success: true } or { success: false, error: string }
   async startShellSession(
     sessionId: string,
     deploymentId: string,
     serviceName: string,
     onOutput: (data: string) => void
-  ): Promise<boolean> {
+  ): Promise<{ success: boolean; error?: string }> {
     const execution = this.executions.get(deploymentId);
     if (!execution) {
       logger.warn({ deploymentId, sessionId }, 'shell: deployment not found');
-      return false;
+      return { success: false, error: 'deployment not found on this provider' };
     }
 
     // try requested service first, then fall back to first available service
@@ -945,14 +1537,77 @@ export class DeploymentExecutor extends EventEmitter {
     if (!containerId) {
       logger.warn({ deploymentId, serviceName, sessionId, availableServices: Array.from(execution.containers.keys()) },
         'shell: no services found');
-      return false;
+      return { success: false, error: 'no containers found for this service' };
     }
 
     try {
       const container = this.docker.getContainer(containerId);
+      const info = await container.inspect();
+      let execContainer = container;
+      let debugContainer: any = null;
+
+      if (info.State.Running) {
+        // container is running, exec directly into it
+        logger.info({ deploymentId, containerId }, 'shell: container running, attaching');
+      } else {
+        // container is stopped - try to start it
+        logger.info({ deploymentId, containerId, state: info.State.Status }, 'shell: container not running, starting it');
+        try {
+          await container.start();
+        } catch (startErr: any) {
+          // ignore "already started" race
+          if (!startErr.message?.includes('already started')) {
+            logger.warn({ err: startErr, containerId }, 'shell: failed to start container');
+          }
+        }
+        await new Promise(r => setTimeout(r, 1500));
+
+        // check if it actually stayed running
+        const recheck = await container.inspect();
+        if (!recheck.State.Running) {
+          // container exits immediately (e.g. node:20-alpine with no long-running process)
+          // commit the stopped container to preserve its filesystem, then run with sleep
+          logger.info({ deploymentId, containerId, image: info.Config.Image },
+            'shell: container exits immediately, creating debug container from snapshot');
+
+          const debugTag = `kova-debug:${containerId.slice(0, 12)}`;
+          const debugName = `kova-debug-${sessionId.replace(/[^a-zA-Z0-9-]/g, '-').slice(0, 60)}`;
+
+          // snapshot the stopped container's filesystem
+          const commitResult = await container.commit({
+            repo: 'kova-debug',
+            tag: containerId.slice(0, 12),
+            comment: 'debug shell snapshot'
+          });
+          logger.info({ debugTag, imageId: commitResult.Id }, 'shell: committed container snapshot');
+
+          debugContainer = await this.docker.createContainer({
+            name: debugName,
+            Image: debugTag,
+            Cmd: ['sh', '-c', 'trap "exit 0" TERM INT; while true; do sleep 1; done'],
+            Tty: true,
+            OpenStdin: true,
+            WorkingDir: info.Config.WorkingDir || '/',
+            Env: info.Config.Env || [],
+            HostConfig: {
+              NetworkMode: info.HostConfig.NetworkMode || 'bridge',
+              Binds: info.HostConfig.Binds || [],
+              AutoRemove: true
+            },
+            Labels: {
+              'kova.deployment': deploymentId,
+              'kova.service': serviceName,
+              'kova.debug-shell': 'true'
+            }
+          });
+          await debugContainer.start();
+          execContainer = debugContainer;
+          logger.info({ deploymentId, debugName }, 'shell: debug container started');
+        }
+      }
 
       // create exec instance for interactive shell
-      const exec = await container.exec({
+      const exec = await execContainer.exec({
         Cmd: ['/bin/sh'],
         AttachStdin: true,
         AttachStdout: true,
@@ -967,37 +1622,45 @@ export class DeploymentExecutor extends EventEmitter {
         Tty: true
       });
 
-      // store session
+      // store session (including debug container + image ref for cleanup)
       this.shellSessions.set(sessionId, {
         exec,
         stream,
         deploymentId,
-        serviceName
+        serviceName,
+        debugContainer,
+        debugImageTag: debugContainer ? `kova-debug:${containerId.slice(0, 12)}` : undefined
       });
 
       // forward output to callback
       stream.on('data', (chunk: Buffer) => {
-        // tty mode - data comes as plain text
         const output = chunk.toString('utf8');
         onOutput(output);
       });
 
       stream.on('end', () => {
         logger.info({ sessionId }, 'shell session stream ended');
-        this.shellSessions.delete(sessionId);
+        this.cleanupShellSession(sessionId);
         this.emit('shell-closed', { sessionId });
       });
 
       stream.on('error', (err: any) => {
         logger.error({ err, sessionId }, 'shell session stream error');
-        this.shellSessions.delete(sessionId);
+        this.cleanupShellSession(sessionId);
       });
 
-      logger.info({ sessionId, deploymentId, serviceName, containerId }, 'shell session started');
-      return true;
-    } catch (err) {
+      logger.info({ sessionId, deploymentId, serviceName, containerId, debug: !!debugContainer }, 'shell session started');
+      return { success: true };
+    } catch (err: any) {
       logger.error({ err, sessionId, deploymentId }, 'failed to start shell session');
-      return false;
+      const msg = err.message || 'failed to start shell';
+      if (msg.includes('is not running')) {
+        return { success: false, error: 'container is not running - it may have crashed' };
+      }
+      if (msg.includes('No such image')) {
+        return { success: false, error: 'container image not available locally' };
+      }
+      return { success: false, error: msg };
     }
   }
 
@@ -1035,6 +1698,180 @@ export class DeploymentExecutor extends EventEmitter {
     }
   }
 
+  // clean up a shell session and its debug container/image if any
+  private cleanupShellSession(sessionId: string): void {
+    const session = this.shellSessions.get(sessionId);
+    if (!session) return;
+
+    // stop debug container (AutoRemove will delete it)
+    if (session.debugContainer) {
+      session.debugContainer.stop({ t: 2 }).catch(() => {
+        // ignore - may already be stopped
+      });
+    }
+
+    // remove the committed snapshot image
+    if (session.debugImageTag) {
+      const img = this.docker.getImage(session.debugImageTag);
+      img.remove({ force: true }).catch(() => {
+        // ignore - best effort cleanup
+      });
+    }
+
+    this.shellSessions.delete(sessionId);
+  }
+
+  // restart all containers in a deployment (stop then start)
+  async restartDeployment(deploymentId: string): Promise<string[]> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      throw new Error('deployment not found');
+    }
+
+    const restarted: string[] = [];
+
+    for (const [serviceName, containerId] of execution.containers.entries()) {
+      try {
+        const container = this.docker.getContainer(containerId);
+        await container.stop({ t: 10 });
+        await container.start();
+        restarted.push(serviceName);
+        logger.info({ deploymentId, serviceName, containerId }, 'container restarted');
+      } catch (err: any) {
+        logger.error({ err, deploymentId, serviceName, containerId }, 'failed to restart container');
+      }
+    }
+
+    return restarted;
+  }
+
+  // create a snapshot of a service's volume
+  async createVolumeSnapshot(
+    deploymentId: string,
+    serviceName: string,
+    snapshotId: string
+  ): Promise<{ volumeName: string; sizeBytes: number; snapshotKey: string }> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      throw new Error('deployment not found');
+    }
+
+    // find the volume for this service
+    const volumePrefix = `kova-${deploymentId}-${serviceName}-`;
+    let volumeName = execution.volumes.find(v => v.startsWith(volumePrefix));
+
+    if (!volumeName) {
+      // check docker directly
+      const volumes = await this.docker.listVolumes();
+      const match = volumes.Volumes?.find(v => v.Name?.startsWith(volumePrefix));
+      if (match) {
+        volumeName = match.Name;
+      }
+    }
+
+    if (!volumeName) {
+      throw new Error(`no volume found for service ${serviceName}`);
+    }
+
+    const snapshotDir = '/var/kova/snapshots';
+    const snapshotKey = `${snapshotId}.tar.gz`;
+
+    // ensure snapshot directory exists on host
+    const fs = await import('fs');
+    if (!fs.existsSync(snapshotDir)) {
+      fs.mkdirSync(snapshotDir, { recursive: true });
+    }
+
+    // create snapshot using a temporary alpine container
+    await this.docker.run(
+      'alpine:latest',
+      ['tar', 'czf', `/snapshots/${snapshotKey}`, '-C', '/data', '.'],
+      process.stdout,
+      {
+        HostConfig: {
+          Binds: [
+            `${volumeName}:/data:ro`,
+            `${snapshotDir}:/snapshots`
+          ],
+          AutoRemove: true
+        }
+      }
+    );
+
+    // get snapshot file size
+    const snapshotPath = `${snapshotDir}/${snapshotKey}`;
+    const stat = fs.statSync(snapshotPath);
+
+    logger.info({ deploymentId, serviceName, volumeName, snapshotId, sizeBytes: stat.size }, 'volume snapshot created');
+
+    return {
+      volumeName,
+      sizeBytes: stat.size,
+      snapshotKey
+    };
+  }
+
+  // restore a service's volume from a snapshot
+  async restoreVolumeSnapshot(
+    deploymentId: string,
+    serviceName: string,
+    snapshotKey: string
+  ): Promise<void> {
+    const execution = this.executions.get(deploymentId);
+    if (!execution) {
+      throw new Error('deployment not found');
+    }
+
+    // find the volume for this service
+    const volumePrefix = `kova-${deploymentId}-${serviceName}-`;
+    let volumeName = execution.volumes.find(v => v.startsWith(volumePrefix));
+
+    if (!volumeName) {
+      const volumes = await this.docker.listVolumes();
+      const match = volumes.Volumes?.find(v => v.Name?.startsWith(volumePrefix));
+      if (match) {
+        volumeName = match.Name;
+      }
+    }
+
+    if (!volumeName) {
+      throw new Error(`no volume found for service ${serviceName}`);
+    }
+
+    const snapshotDir = '/var/kova/snapshots';
+
+    // clear existing volume data
+    await this.docker.run(
+      'alpine:latest',
+      ['sh', '-c', 'rm -rf /data/*'],
+      process.stdout,
+      {
+        HostConfig: {
+          Binds: [`${volumeName}:/data`],
+          AutoRemove: true
+        }
+      }
+    );
+
+    // restore from snapshot
+    await this.docker.run(
+      'alpine:latest',
+      ['tar', 'xzf', `/snapshots/${snapshotKey}`, '-C', '/data'],
+      process.stdout,
+      {
+        HostConfig: {
+          Binds: [
+            `${volumeName}:/data`,
+            `${snapshotDir}:/snapshots:ro`
+          ],
+          AutoRemove: true
+        }
+      }
+    );
+
+    logger.info({ deploymentId, serviceName, volumeName, snapshotKey }, 'volume snapshot restored');
+  }
+
   // close shell session
   closeShellSession(sessionId: string): void {
     const session = this.shellSessions.get(sessionId);
@@ -1048,7 +1885,7 @@ export class DeploymentExecutor extends EventEmitter {
       // ignore
     }
 
-    this.shellSessions.delete(sessionId);
+    this.cleanupShellSession(sessionId);
     logger.info({ sessionId }, 'shell session closed');
   }
 }

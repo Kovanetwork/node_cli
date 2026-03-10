@@ -3,6 +3,7 @@ import { startNode } from './commands/start.js';
 import { statusCommand } from './commands/status.js';
 import { stopCommand } from './commands/stop.js';
 import { earningsCommand } from './commands/earnings.js';
+import { registerDeployCommands } from './commands/deploy.js';
 import pino from 'pino';
 
 // eh whatever logger setup
@@ -47,6 +48,9 @@ program
   .command('earnings')
   .description('see how much youve made')
   .action(earningsCommand);
+
+// deployment management commands (customer side)
+registerDeployCommands(program);
 
 // lets gooo
 program.parse(process.argv);
