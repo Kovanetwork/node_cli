@@ -289,12 +289,12 @@ export class NodeAPIServer {
       const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
       if (!this.authToken) {
         logger.warn({ deploymentId: req.params.deploymentId }, 'shell access denied - no auth token configured on provider');
-        connection.socket.close(1008, 'provider auth not configured');
+        connection.close(1008, 'provider auth not configured');
         return;
       }
       if (!token || token !== this.authToken) {
         logger.warn({ deploymentId: req.params.deploymentId, hasToken: !!token, tokenLen: token?.length }, 'shell access denied - token mismatch');
-        connection.socket.close(1008, 'unauthorized - invalid access token');
+        connection.close(1008, 'unauthorized - invalid access token');
         return;
       }
 
@@ -304,13 +304,13 @@ export class NodeAPIServer {
       logger.info({ deploymentId, serviceName }, 'direct shell websocket connection');
 
       if (!this.deploymentExecutor) {
-        connection.socket.close(1008, 'deployment executor not available');
+        connection.close(1008, 'deployment executor not available');
         return;
       }
 
       let sessionId: string | null = null;
 
-      connection.socket.on('message', async (data: Buffer) => {
+      connection.on('message', async (data: Buffer) => {
         try {
           const message = JSON.parse(data.toString());
 
@@ -324,15 +324,15 @@ export class NodeAPIServer {
               serviceName,
               (output: string) => {
                 // send output back to client
-                connection.socket.send(JSON.stringify({ type: 'output', data: output }));
+                connection.send(JSON.stringify({ type: 'output', data: output }));
               }
             );
 
             if (result.success) {
-              connection.socket.send(JSON.stringify({ type: 'ready', sessionId }));
+              connection.send(JSON.stringify({ type: 'ready', sessionId }));
             } else {
-              connection.socket.send(JSON.stringify({ type: 'error', message: result.error || 'failed to start shell session' }));
-              connection.socket.close(1008, result.error || 'shell start failed');
+              connection.send(JSON.stringify({ type: 'error', message: result.error || 'failed to start shell session' }));
+              connection.close(1008, result.error || 'shell start failed');
             }
           } else if (message.type === 'input' && sessionId) {
             this.deploymentExecutor!.sendShellInput(sessionId, message.data);
@@ -341,11 +341,11 @@ export class NodeAPIServer {
           }
         } catch (err) {
           logger.error({ err, deploymentId }, 'shell message error');
-          connection.socket.send(JSON.stringify({ type: 'error', message: 'command failed' }));
+          connection.send(JSON.stringify({ type: 'error', message: 'command failed' }));
         }
       });
 
-      connection.socket.on('close', () => {
+      connection.on('close', () => {
         if (sessionId && this.deploymentExecutor) {
           this.deploymentExecutor.closeShellSession(sessionId);
         }
@@ -406,7 +406,7 @@ export class NodeAPIServer {
     this.app.get('/deployments/:deploymentId/stats/stream', { websocket: true }, async (connection: any, req: any) => {
       const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
       if (!this.authToken || !token || token !== this.authToken) {
-        connection.socket.close(1008, 'unauthorized');
+        connection.close(1008, 'unauthorized');
         return;
       }
 
@@ -418,12 +418,12 @@ export class NodeAPIServer {
         if (!active) return;
         try {
           const stats = await this.deploymentExecutor!.getDeploymentStats(deploymentId);
-          if (active && connection.socket.readyState === 1) {
-            connection.socket.send(JSON.stringify(stats));
+          if (active && connection.readyState === 1) {
+            connection.send(JSON.stringify(stats));
           }
         } catch (err: any) {
-          if (active && connection.socket.readyState === 1) {
-            connection.socket.send(JSON.stringify({ error: err.message }));
+          if (active && connection.readyState === 1) {
+            connection.send(JSON.stringify({ error: err.message }));
           }
         }
       };
@@ -432,12 +432,12 @@ export class NodeAPIServer {
       await sendStats();
       const interval = setInterval(sendStats, intervalMs);
 
-      connection.socket.on('close', () => {
+      connection.on('close', () => {
         active = false;
         clearInterval(interval);
       });
 
-      connection.socket.on('error', () => {
+      connection.on('error', () => {
         active = false;
         clearInterval(interval);
       });
