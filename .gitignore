@@ -3,8 +3,8 @@ node_modules/
 package-lock.json
 yarn.lock
 
-# build output
-dist/
+# build output - dist is checked in for npm installs from git
+# dist/
 *.tsbuildinfo
 
 # environment
