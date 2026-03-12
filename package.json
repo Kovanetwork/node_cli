@@ -1,6 +1,6 @@
 {
   "name": "kova-node-cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "kova network provider node - earn by sharing compute",
   "main": "dist/cli.js",
